@@ -2,12 +2,14 @@ import { UserError, type ToolOutputImage } from '@openai/agents-core';
 import {
   cloneManifest,
   Manifest,
+  SandboxLifecycleError,
   SandboxProviderError,
   SandboxUnsupportedFeatureError,
   normalizeSandboxClientCreateArgs,
   type SandboxClient,
   type SandboxClientCreateArgs,
   type SandboxClientOptions,
+  type SandboxClientResumeOptions,
   type SandboxPreservedSessionReuseOptions,
   type SandboxArchiveLimits,
   type SandboxConcurrencyLimits,
@@ -23,16 +25,24 @@ import {
   type WriteStdinArgs,
   type WorkspaceArchiveData,
   type WorkspaceArchiveOptions,
+  type ProcessEnvironmentAccessOptions,
   validateSandboxArchiveLimits,
 } from '@openai/agents-core/sandbox';
 import {
+  bindProcessEnvironmentAccess,
+  cloneManifestWithProcessEnvironmentAccess,
   assertExistingMountTopologyPreserved,
   assertLiveMountCredentialAuthorityMatches,
   captureLiveMountCredentialAuthority,
   copyManifestMountCredentialExposurePolicy,
   copyValidatedMountEffectivePaths,
+  environmentWithoutProcessEnvValues,
+  getRunStateSessionTrustedConfig,
   manifestHasInContainerMounts,
+  manifestHasProcessEnvValues,
+  protectProcessEnvironmentSessionStateManifest,
   validateMountCredentialBoundaries,
+  withProcessEnvironmentErrorRedaction,
   withExclusiveSandboxManifestMutation,
 } from '@openai/agents-core/sandbox/internal';
 import {
@@ -113,6 +123,7 @@ import {
   materializeLocalSourceManifest,
 } from '../shared/localSources';
 import {
+  deserializeManifest,
   prepareManifestMounts,
   prepareMaterializedManifestTransition,
 } from '../shared/manifest';
@@ -188,7 +199,8 @@ type DaytonaPtyHandle = {
   error?: string;
 };
 
-export interface DaytonaSandboxClientOptions extends SandboxClientOptions {
+export interface DaytonaSandboxClientOptions
+  extends SandboxClientOptions, ProcessEnvironmentAccessOptions {
   image?: string;
   resources?: Record<string, unknown>;
   env?: Record<string, string>;
@@ -246,7 +258,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     concurrencyLimits?: SandboxConcurrencyLimits;
     archiveLimits?: SandboxArchiveLimits | null;
   }) {
-    this.state = args.state;
+    this.state = protectProcessEnvironmentSessionStateManifest(args.state);
     this.sandbox = args.sandbox;
     this.concurrencyLimits = args.concurrencyLimits;
     this.setArchiveLimits(args.archiveLimits);
@@ -302,7 +314,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     const result = await this.sandbox.process.executeCommand(
       commandForDaytonaUser(args.cmd, args.runAs),
       resolveSandboxWorkdir(this.state.manifest.root, args.workdir),
-      this.state.environment,
+      this.commandEnvironment(),
     );
     const combinedOutput = result.artifacts?.stdout ?? result.result ?? '';
     const output = truncateOutput(combinedOutput, args.maxOutputTokens);
@@ -345,7 +357,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     const handle = await this.sandbox.process.createPty({
       id: providerSessionId,
       cwd: resolveSandboxWorkdir(this.state.manifest.root, args.workdir),
-      envs: this.state.environment,
+      envs: this.commandEnvironment(),
       cols: 80,
       rows: 24,
       onData: (data: Uint8Array | string) => appendPtyOutput(entry, data),
@@ -481,7 +493,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
           const result = await this.sandbox.process.executeCommand(
             command,
             this.state.manifest.root,
-            this.state.environment,
+            this.commandEnvironment(),
             5,
           );
           return {
@@ -510,7 +522,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
       const result = await this.sandbox.process.executeCommand(
         'true',
         this.state.manifest.root,
-        this.state.environment,
+        this.commandEnvironment(),
         5,
       );
       return result.exitCode === 0;
@@ -589,7 +601,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     assertExistingMountTopologyPreserved(this.state.manifest, nextManifest);
     validateRcloneMountEnvironmentCredentialExposure(
       nextManifest,
-      this.state.environment,
+      this.commandEnvironment(),
     );
     const privilegedTransition = manifestHasInContainerMounts(
       new Manifest({ entries: { [logicalPath]: args.entry } }),
@@ -797,7 +809,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     const result = await this.sandbox.process.executeCommand(
       `mkdir -p -- ${shellQuote(root)}`,
       '/',
-      this.state.environment,
+      this.commandEnvironment(),
     );
     if (result.exitCode !== 0) {
       throw new SandboxProviderError(
@@ -866,9 +878,18 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
           backend_id: 'daytona',
           sandbox_id: this.state.sandboxId,
         },
-        async () => {
-          await this.sandbox.stop();
-        },
+        async () =>
+          await withProcessEnvironmentErrorRedaction(
+            this.state.manifest,
+            {
+              provider: 'daytona',
+              operation: 'sandbox stop',
+              details: { sandboxId: this.state.sandboxId },
+            },
+            async () => {
+              await this.sandbox.stop();
+            },
+          ),
       );
     })();
     await this.stopPromise;
@@ -883,12 +904,21 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
           backend_id: 'daytona',
           sandbox_id: this.state.sandboxId,
         },
-        async () => {
-          await this.unmountActiveMounts();
-          await deleteDaytonaSandboxWithRetry(async () => {
-            await this.sandbox.delete();
-          });
-        },
+        async () =>
+          await withProcessEnvironmentErrorRedaction(
+            this.state.manifest,
+            {
+              provider: 'daytona',
+              operation: 'sandbox shutdown',
+              details: { sandboxId: this.state.sandboxId },
+            },
+            async () => {
+              await this.unmountActiveMounts();
+              await deleteDaytonaSandboxWithRetry(async () => {
+                await this.sandbox.delete();
+              });
+            },
+          ),
       );
     })();
     await this.deletePromise;
@@ -994,12 +1024,13 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
   private mountCommandRunner(
     environment: Readonly<Record<string, string>> = this.state.environment,
   ): RemoteMountCommand {
+    const commandEnvironment = this.commandEnvironment(environment);
     return async (command, options = {}) => {
       const commandToRun = commandForDaytonaUser(command, options.user);
       const result = await this.sandbox.process.executeCommand(
         commandToRun,
         this.state.manifest.root,
-        environment,
+        commandEnvironment,
         options.timeoutMs ? Math.ceil(options.timeoutMs / 1000) : undefined,
       );
       return {
@@ -1010,6 +1041,12 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     };
   }
 
+  private commandEnvironment(
+    environment: Readonly<Record<string, string>> = this.state.environment,
+  ): Record<string, string> {
+    return environmentWithoutProcessEnvValues(this.state.manifest, environment);
+  }
+
   private async runAsCommandRunner(
     command: string,
     options: { runAs?: string } = {},
@@ -1017,7 +1054,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     const result = await this.sandbox.process.executeCommand(
       commandForDaytonaUser(command, options.runAs),
       this.state.manifest.root,
-      this.state.environment,
+      this.commandEnvironment(),
       this.state.timeoutSec,
     );
     return {
@@ -1033,7 +1070,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
         const result = await this.sandbox.process.executeCommand(
           command,
           this.state.manifest.root,
-          this.state.environment,
+          this.commandEnvironment(),
           this.state.timeoutSec,
         );
         return {
@@ -1145,7 +1182,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     const result = await this.sandbox.process.executeCommand(
       command,
       this.state.manifest.root,
-      this.state.environment,
+      this.commandEnvironment(),
       this.state.timeoutSec,
     );
     if (result.exitCode !== 0) {
@@ -1267,8 +1304,14 @@ export class DaytonaSandboxClient implements SandboxClient<
     this.options = options;
   }
 
-  resolveTrustedManifestForResume(manifest: Manifest): Manifest {
-    return resolveManifestRoot(manifest);
+  resolveTrustedManifestForResume(
+    manifest: Manifest,
+    options: DaytonaSandboxClientOptions = {},
+  ): Manifest {
+    return cloneManifestWithProcessEnvironmentAccess(
+      resolveManifestRoot(manifest),
+      { ...this.options, ...options },
+    );
   }
 
   async create(
@@ -1277,108 +1320,155 @@ export class DaytonaSandboxClient implements SandboxClient<
   ): Promise<DaytonaSandboxSession> {
     const createArgs = normalizeSandboxClientCreateArgs(args, manifestOptions);
     assertCoreSnapshotUnsupported('DaytonaSandboxClient', createArgs.snapshot);
-    const manifest = createArgs.manifest;
     const resolvedOptions = {
       ...this.options,
       ...createArgs.options,
     };
-    const resolvedManifest = resolveManifestRoot(manifest);
+    const resolvedManifest = cloneManifestWithProcessEnvironmentAccess(
+      resolveManifestRoot(createArgs.manifest),
+      resolvedOptions,
+    );
     assertSandboxManifestMetadataSupported(
       'DaytonaSandboxClient',
       resolvedManifest,
       MOUNT_MANIFEST_METADATA_SUPPORT,
     );
-    const client = await createDaytonaClient(resolvedOptions);
-
+    const lifecycleDetails: Record<string, unknown> = {};
+    const client = await withProcessEnvironmentErrorRedaction(
+      resolvedManifest,
+      {
+        provider: 'daytona',
+        operation: 'sandbox creation',
+        details: lifecycleDetails,
+      },
+      async () => await createDaytonaClient(resolvedOptions),
+    );
     return await withSandboxSpan(
       'sandbox.start',
       {
         backend_id: this.backendId,
       },
-      async () => {
-        const environment = await materializeEnvironment(
+      async () =>
+        await withProcessEnvironmentErrorRedaction(
           resolvedManifest,
-          resolvedOptions.env,
-        );
-        validateRcloneMountEnvironmentCredentialExposure(
-          resolvedManifest,
-          environment,
-        );
-        const sandbox = await withProviderError(
-          'DaytonaSandboxClient',
-          'daytona',
-          'create sandbox',
-          async () =>
-            await client.create(
-              {
-                ...(resolvedOptions.sandboxSnapshotName
-                  ? { snapshot: resolvedOptions.sandboxSnapshotName }
-                  : { image: resolvedOptions.image ?? 'debian:12.9' }),
-                ...(!resolvedOptions.sandboxSnapshotName &&
-                resolvedOptions.resources
-                  ? { resources: resolvedOptions.resources }
-                  : {}),
-                ...(resolvedOptions.name ? { name: resolvedOptions.name } : {}),
-                ...(typeof resolvedOptions.autoStopInterval === 'number'
-                  ? { autoStopInterval: resolvedOptions.autoStopInterval }
-                  : {}),
-                ...(typeof resolvedOptions.startTimeoutSec === 'number'
-                  ? { startTimeoutSec: resolvedOptions.startTimeoutSec }
-                  : {}),
-                ...(typeof resolvedOptions.timeoutSec === 'number'
-                  ? { timeoutSec: resolvedOptions.timeoutSec }
-                  : {}),
-                ...(resolvedOptions.exposedPorts
-                  ? { exposedPorts: resolvedOptions.exposedPorts }
-                  : {}),
-                ...(typeof resolvedOptions.exposedPortUrlTtlS === 'number'
-                  ? { exposedPortUrlTtlS: resolvedOptions.exposedPortUrlTtlS }
-                  : {}),
-                envVars: environment,
-              },
-              ...(typeof resolvedOptions.createTimeoutSec === 'number'
-                ? [{ timeout: resolvedOptions.createTimeoutSec }]
-                : []),
-            ),
-          resolvedOptions.sandboxSnapshotName
-            ? { snapshot: resolvedOptions.sandboxSnapshotName }
-            : { image: resolvedOptions.image ?? 'debian:12.9' },
-        );
-
-        const session = new DaytonaSandboxSession({
-          sandbox,
-          concurrencyLimits: createArgs.concurrencyLimits,
-          archiveLimits: createArgs.archiveLimits,
-          state: {
-            manifest: resolvedManifest,
-            sandboxId: sandbox.id,
-            image: resolvedOptions.image,
-            resources: resolvedOptions.resources,
-            pauseOnExit: resolvedOptions.pauseOnExit ?? false,
-            createTimeoutSec: resolvedOptions.createTimeoutSec,
-            startTimeoutSec: resolvedOptions.startTimeoutSec,
-            timeoutSec: resolvedOptions.timeoutSec,
-            sandboxSnapshotName: resolvedOptions.sandboxSnapshotName,
-            configuredExposedPorts: resolvedOptions.exposedPorts,
-            exposedPortUrlTtlS: resolvedOptions.exposedPortUrlTtlS,
-            name: resolvedOptions.name,
-            autoStopInterval: resolvedOptions.autoStopInterval,
-            environment,
-            apiKey: resolvedOptions.apiKey,
-            apiUrl: resolvedOptions.apiUrl,
-            target: resolvedOptions.target,
+          {
+            provider: 'daytona',
+            operation: 'sandbox creation',
+            details: lifecycleDetails,
           },
-        });
+          async () => {
+            const environment = await materializeEnvironment(
+              resolvedManifest,
+              resolvedOptions.env,
+            );
+            validateRcloneMountEnvironmentCredentialExposure(
+              resolvedManifest,
+              environment,
+            );
+            const sandbox = await withProviderError(
+              'DaytonaSandboxClient',
+              'daytona',
+              'create sandbox',
+              async () =>
+                await client.create(
+                  {
+                    ...(resolvedOptions.sandboxSnapshotName
+                      ? { snapshot: resolvedOptions.sandboxSnapshotName }
+                      : { image: resolvedOptions.image ?? 'debian:12.9' }),
+                    ...(!resolvedOptions.sandboxSnapshotName &&
+                    resolvedOptions.resources
+                      ? { resources: resolvedOptions.resources }
+                      : {}),
+                    ...(resolvedOptions.name
+                      ? { name: resolvedOptions.name }
+                      : {}),
+                    ...(typeof resolvedOptions.autoStopInterval === 'number'
+                      ? { autoStopInterval: resolvedOptions.autoStopInterval }
+                      : {}),
+                    ...(typeof resolvedOptions.startTimeoutSec === 'number'
+                      ? { startTimeoutSec: resolvedOptions.startTimeoutSec }
+                      : {}),
+                    ...(typeof resolvedOptions.timeoutSec === 'number'
+                      ? { timeoutSec: resolvedOptions.timeoutSec }
+                      : {}),
+                    ...(resolvedOptions.exposedPorts
+                      ? { exposedPorts: resolvedOptions.exposedPorts }
+                      : {}),
+                    ...(typeof resolvedOptions.exposedPortUrlTtlS === 'number'
+                      ? {
+                          exposedPortUrlTtlS:
+                            resolvedOptions.exposedPortUrlTtlS,
+                        }
+                      : {}),
+                    envVars: environment,
+                  },
+                  ...(typeof resolvedOptions.createTimeoutSec === 'number'
+                    ? [{ timeout: resolvedOptions.createTimeoutSec }]
+                    : []),
+                ),
+              resolvedOptions.sandboxSnapshotName
+                ? { snapshot: resolvedOptions.sandboxSnapshotName }
+                : { image: resolvedOptions.image ?? 'debian:12.9' },
+              {
+                redactProviderError:
+                  manifestHasProcessEnvValues(resolvedManifest),
+              },
+            );
 
-        try {
-          await session.prepareWorkspaceRoot();
-          await session.materializeInitialManifest(resolvedManifest);
-        } catch (error) {
-          session.state.pauseOnExit = false;
-          await closeRemoteSessionOnManifestError('Daytona', session, error);
-        }
-        return session;
-      },
+            const session = new DaytonaSandboxSession({
+              sandbox,
+              concurrencyLimits: createArgs.concurrencyLimits,
+              archiveLimits: createArgs.archiveLimits,
+              state: {
+                manifest: resolvedManifest,
+                sandboxId: sandbox.id,
+                image: resolvedOptions.image,
+                resources: resolvedOptions.resources,
+                pauseOnExit: resolvedOptions.pauseOnExit ?? false,
+                createTimeoutSec: resolvedOptions.createTimeoutSec,
+                startTimeoutSec: resolvedOptions.startTimeoutSec,
+                timeoutSec: resolvedOptions.timeoutSec,
+                sandboxSnapshotName: resolvedOptions.sandboxSnapshotName,
+                configuredExposedPorts: resolvedOptions.exposedPorts,
+                exposedPortUrlTtlS: resolvedOptions.exposedPortUrlTtlS,
+                name: resolvedOptions.name,
+                autoStopInterval: resolvedOptions.autoStopInterval,
+                environment,
+                apiKey: resolvedOptions.apiKey,
+                apiUrl: resolvedOptions.apiUrl,
+                target: resolvedOptions.target,
+              },
+            });
+
+            try {
+              await session.prepareWorkspaceRoot();
+              await session.materializeInitialManifest(resolvedManifest);
+            } catch (error) {
+              session.state.pauseOnExit = false;
+              if (manifestHasProcessEnvValues(resolvedManifest)) {
+                try {
+                  await session.close();
+                } catch {
+                  lifecycleDetails.replacementSandboxId = sandbox.id;
+                  throw new SandboxLifecycleError(
+                    'Daytona process environment sandbox creation failed during setup and cleanup.',
+                    {
+                      provider: 'daytona',
+                      replacementSandboxId: sandbox.id,
+                    },
+                  );
+                }
+                throw error;
+              }
+              await closeRemoteSessionOnManifestError(
+                'Daytona',
+                session,
+                error,
+              );
+            }
+            return session;
+          },
+        ),
     );
   }
 
@@ -1397,6 +1487,12 @@ export class DaytonaSandboxClient implements SandboxClient<
     options: SandboxPreservedSessionReuseOptions<DaytonaSandboxClientOptions> = {},
   ): Promise<boolean> {
     if (isRemoteSandboxSessionStateUnsafe(state) || !options.trustedManifest) {
+      return false;
+    }
+    if (
+      manifestHasProcessEnvValues(state.manifest) ||
+      manifestHasProcessEnvValues(options.trustedManifest)
+    ) {
       return false;
     }
     const trustedManifest = resolveManifestRoot(options.trustedManifest);
@@ -1418,68 +1514,168 @@ export class DaytonaSandboxClient implements SandboxClient<
   async deserializeSessionState(
     state: Record<string, unknown>,
   ): Promise<DaytonaSandboxSessionState> {
-    const baseState = await rehydrateRemoteSandboxSessionStateValues(
-      state,
-      this.options.env,
-    );
-    return {
-      ...state,
-      ...baseState,
-      sandboxId: readString(state, 'sandboxId'),
-      pauseOnExit: Boolean(state.pauseOnExit),
-      image: readOptionalString(state, 'image'),
-      resources: readOptionalRecord(state.resources),
-      createTimeoutSec: readOptionalNumber(state, 'createTimeoutSec'),
-      startTimeoutSec: readOptionalNumber(state, 'startTimeoutSec'),
-      timeoutSec: readOptionalNumber(state, 'timeoutSec'),
-      sandboxSnapshotName: readOptionalString(state, 'sandboxSnapshotName'),
-      configuredExposedPorts: readOptionalNumberArray(
-        state.configuredExposedPorts,
-      ),
-      exposedPortUrlTtlS: readOptionalNumber(state, 'exposedPortUrlTtlS'),
-      name: readOptionalString(state, 'name'),
-      autoStopInterval: readOptionalNumber(state, 'autoStopInterval'),
-      apiKey: readOptionalString(state, 'apiKey'),
-      apiUrl: readOptionalString(state, 'apiUrl'),
-      target: readOptionalString(state, 'target'),
+    const trustedConfig = getRunStateSessionTrustedConfig(state);
+    const resolvedOptions = {
+      ...this.options,
+      ...(trustedConfig?.clientOptions as
+        DaytonaSandboxClientOptions | undefined),
     };
+    const manifest = bindProcessEnvironmentAccess(
+      deserializeManifest(
+        state.manifest as Record<string, unknown> | undefined,
+      ),
+      resolvedOptions,
+    );
+    return await withProcessEnvironmentErrorRedaction(
+      manifest,
+      { provider: 'daytona', operation: 'sandbox state deserialization' },
+      async () => {
+        const baseState = await rehydrateRemoteSandboxSessionStateValues(
+          state,
+          resolvedOptions.env,
+          () => manifest,
+        );
+        return {
+          ...state,
+          ...baseState,
+          sandboxId: readString(state, 'sandboxId'),
+          pauseOnExit: Boolean(state.pauseOnExit),
+          image: readOptionalString(state, 'image'),
+          resources: readOptionalRecord(state.resources),
+          createTimeoutSec: readOptionalNumber(state, 'createTimeoutSec'),
+          startTimeoutSec: readOptionalNumber(state, 'startTimeoutSec'),
+          timeoutSec: readOptionalNumber(state, 'timeoutSec'),
+          sandboxSnapshotName: readOptionalString(state, 'sandboxSnapshotName'),
+          configuredExposedPorts: readOptionalNumberArray(
+            state.configuredExposedPorts,
+          ),
+          exposedPortUrlTtlS: readOptionalNumber(state, 'exposedPortUrlTtlS'),
+          name: readOptionalString(state, 'name'),
+          autoStopInterval: readOptionalNumber(state, 'autoStopInterval'),
+          apiKey: readOptionalString(state, 'apiKey'),
+          apiUrl: readOptionalString(state, 'apiUrl'),
+          target: readOptionalString(state, 'target'),
+        };
+      },
+    );
   }
 
   async resume(
     state: DaytonaSandboxSessionState,
+    options: SandboxClientResumeOptions<DaytonaSandboxClientOptions> = {},
   ): Promise<DaytonaSandboxSession> {
-    assertRemoteSandboxSessionStateCanResume(state);
-    const client = await createDaytonaClient({
-      ...this.options,
-      apiKey: state.apiKey ?? this.options.apiKey,
-      apiUrl: state.apiUrl ?? this.options.apiUrl,
-      target: state.target ?? this.options.target,
-    });
-    let sandbox: DaytonaSandboxLike;
-    try {
-      sandbox = await client.get(state.sandboxId);
-      await sandbox.start(state.startTimeoutSec);
-    } catch (error) {
-      assertResumeRecreateAllowed(error, {
-        providerName: 'DaytonaSandboxClient',
+    const resolvedOptions = { ...this.options, ...options.clientOptions };
+    const manifest = cloneManifestWithProcessEnvironmentAccess(
+      state.manifest,
+      resolvedOptions,
+    );
+    state.manifest = manifest;
+    const hasProtectedProcessEnvironment =
+      manifestHasProcessEnvValues(manifest);
+    const resumeState = hasProtectedProcessEnvironment
+      ? { ...state, manifest }
+      : state;
+    assertRemoteSandboxSessionStateCanResume(resumeState);
+    const previousSandboxId = state.sandboxId;
+    const lifecycleDetails: Record<string, unknown> = {
+      sandboxId: previousSandboxId,
+    };
+    return await withProcessEnvironmentErrorRedaction(
+      manifest,
+      {
         provider: 'daytona',
-        details: { sandboxId: state.sandboxId },
-      });
-      return await this.recreateFromPersistedState(client, state);
-    }
-    const session = new DaytonaSandboxSession({
-      state,
-      sandbox,
-      archiveLimits: this.options.archiveLimits,
-    });
-    await session.prepareWorkspaceRoot();
-    await session.rematerializeMountEntries();
-    return session;
+        operation: 'sandbox resume',
+        details: lifecycleDetails,
+      },
+      async () => {
+        if (hasProtectedProcessEnvironment) {
+          resumeState.environment = {
+            ...environmentWithoutProcessEnvValues(
+              manifest,
+              resumeState.environment,
+            ),
+            ...(await materializeEnvironment(manifest, resolvedOptions.env)),
+          };
+          validateRcloneMountEnvironmentCredentialExposure(
+            manifest,
+            resumeState.environment,
+          );
+        }
+        const client = await createDaytonaClient({
+          ...resolvedOptions,
+          apiKey: resumeState.apiKey ?? resolvedOptions.apiKey,
+          apiUrl: resumeState.apiUrl ?? resolvedOptions.apiUrl,
+          target: resumeState.target ?? resolvedOptions.target,
+        });
+        let sandbox: DaytonaSandboxLike;
+        if (hasProtectedProcessEnvironment) {
+          let previousSandbox: DaytonaSandboxLike | undefined;
+          let authenticatedPreviousSandboxId: string | undefined;
+          try {
+            previousSandbox = await client.get(previousSandboxId);
+            authenticatedPreviousSandboxId = previousSandbox.id;
+          } catch (error) {
+            assertResumeRecreateAllowed(error, {
+              providerName: 'DaytonaSandboxClient',
+              provider: 'daytona',
+              details: { sandboxId: previousSandboxId },
+            });
+          }
+          const replacement = await this.recreateFromPersistedState(
+            client,
+            resumeState,
+            lifecycleDetails,
+            authenticatedPreviousSandboxId,
+          );
+          if (previousSandbox) {
+            try {
+              await deleteDaytonaSandboxWithRetry(async () => {
+                await previousSandbox.delete();
+              });
+            } catch {
+              lifecycleDetails.previousSandboxId = previousSandbox.id;
+              lifecycleDetails.replacementSandboxId =
+                replacement.state.sandboxId;
+              throw new SandboxLifecycleError(
+                'Daytona process environment replacement could not confirm retirement of the previous sandbox; the replacement was preserved.',
+                {
+                  provider: 'daytona',
+                  previousSandboxId: previousSandbox.id,
+                  replacementSandboxId: replacement.state.sandboxId,
+                },
+              );
+            }
+          }
+          return replacement;
+        }
+        try {
+          sandbox = await client.get(state.sandboxId);
+          await sandbox.start(state.startTimeoutSec);
+        } catch (error) {
+          assertResumeRecreateAllowed(error, {
+            providerName: 'DaytonaSandboxClient',
+            provider: 'daytona',
+            details: { sandboxId: state.sandboxId },
+          });
+          return await this.recreateFromPersistedState(client, state);
+        }
+        const session = new DaytonaSandboxSession({
+          state,
+          sandbox,
+          archiveLimits: resolvedOptions.archiveLimits,
+        });
+        await session.prepareWorkspaceRoot();
+        await session.rematerializeMountEntries();
+        return session;
+      },
+    );
   }
 
   private async recreateFromPersistedState(
     client: DaytonaClientLike,
     state: DaytonaSandboxSessionState,
+    lifecycleDetails?: Record<string, unknown>,
+    authenticatedPreviousSandboxId?: string,
   ): Promise<DaytonaSandboxSession> {
     const sandbox = await withProviderError(
       'DaytonaSandboxClient',
@@ -1519,6 +1715,9 @@ export class DaytonaSandboxClient implements SandboxClient<
       state.sandboxSnapshotName
         ? { snapshot: state.sandboxSnapshotName }
         : { image: state.image ?? 'debian:12.9' },
+      {
+        redactProviderError: manifestHasProcessEnvValues(state.manifest),
+      },
     );
     const nextState: DaytonaSandboxSessionState = {
       ...state,
@@ -1536,6 +1735,30 @@ export class DaytonaSandboxClient implements SandboxClient<
       await session.materializeInitialManifest(state.manifest);
     } catch (error) {
       session.state.pauseOnExit = false;
+      if (manifestHasProcessEnvValues(state.manifest)) {
+        try {
+          await session.close();
+        } catch {
+          if (lifecycleDetails) {
+            if (authenticatedPreviousSandboxId !== undefined) {
+              lifecycleDetails.previousSandboxId =
+                authenticatedPreviousSandboxId;
+            }
+            lifecycleDetails.replacementSandboxId = session.state.sandboxId;
+          }
+          throw new SandboxLifecycleError(
+            'Daytona process environment replacement failed during setup and cleanup.',
+            {
+              provider: 'daytona',
+              ...(authenticatedPreviousSandboxId !== undefined
+                ? { previousSandboxId: authenticatedPreviousSandboxId }
+                : {}),
+              replacementSandboxId: session.state.sandboxId,
+            },
+          );
+        }
+        throw error;
+      }
       await closeRemoteSessionOnManifestError('Daytona', session, error);
     }
     return session;

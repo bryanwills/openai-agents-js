@@ -48,7 +48,13 @@ import {
   type WriteStdinArgs,
   type WorkspaceArchiveOptions,
 } from '../session';
-import { cloneManifest, Manifest, normalizeRelativePath } from '../manifest';
+import {
+  assertProcessEnvValuesUnsupported,
+  cloneManifest,
+  Manifest,
+  normalizeRelativePath,
+  protectProcessEnvironmentSessionStateManifest,
+} from '../manifest';
 import {
   SandboxConfigurationError,
   SandboxUnsupportedFeatureError,
@@ -181,7 +187,7 @@ export class UnixLocalSandboxSession<
     defaultShell?: string;
     archiveLimits?: SandboxArchiveLimits | null;
   }) {
-    this.state = args.state;
+    this.state = protectProcessEnvironmentSessionStateManifest(args.state);
     this.defaultShell = args.defaultShell;
     this.setArchiveLimits(args.archiveLimits);
   }
@@ -457,6 +463,7 @@ export class UnixLocalSandboxSession<
   }
 
   async applyManifest(manifest: Manifest, runAs?: string): Promise<void> {
+    assertProcessEnvValuesUnsupported(manifest, 'unix_local');
     const manifestSnapshot = cloneManifest(manifest);
     return await withExclusiveSandboxManifestMutation(this.state, async () =>
       this.applyManifestExclusive(manifestSnapshot, runAs),
@@ -952,6 +959,7 @@ export class UnixLocalSandboxClient implements SandboxClient<
   ): Promise<UnixLocalSandboxSession> {
     const createArgs = normalizeSandboxClientCreateArgs(args, manifestOptions);
     const manifest = createArgs.manifest;
+    assertProcessEnvValuesUnsupported(manifest, 'unix_local');
     const resolvedOptions = {
       ...this.options,
       ...createArgs.options,
@@ -1005,6 +1013,7 @@ export class UnixLocalSandboxClient implements SandboxClient<
     state: UnixLocalSandboxSessionState,
     options: SandboxClientResumeOptions = {},
   ): Promise<UnixLocalSandboxSession> {
+    assertProcessEnvValuesUnsupported(state.manifest, 'unix_local');
     assertMountCredentialsRebound(state);
     validateMountCredentialBoundaries(state.manifest);
     assertHostPathGrantsRebound(state);

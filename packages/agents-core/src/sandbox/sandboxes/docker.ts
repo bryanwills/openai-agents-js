@@ -56,10 +56,18 @@ import type {
 } from '../client';
 import { normalizeSandboxClientCreateArgs } from '../client';
 import {
+  bindProcessEnvironmentAccess,
   cloneManifest,
+  cloneManifestWithProcessEnvironmentAccess,
   copyManifestMountCredentialExposurePolicy,
+  copyProcessEnvironmentProtection,
+  environmentWithoutProcessEnvValues,
   isEnvValueReference,
+  manifestHasProcessEnvValues,
   Manifest,
+  ProcessEnvValue,
+  type ProcessEnvironmentAccessOptions,
+  withProcessEnvironmentErrorRedaction,
 } from '../manifest';
 import {
   WorkspacePathPolicy,
@@ -89,8 +97,10 @@ import {
   pathExists,
 } from './shared/localWorkspace';
 import {
+  assertProcessEnvironmentDestinationsPreserved,
   assertHostPathGrantsRebound,
   assertMountCredentialsRebound,
+  deserializeManifest,
   mergeManifestEntryDelta,
   mergeManifestDelta,
   sanitizeEnvironmentForPersistence,
@@ -163,8 +173,24 @@ const DOCKER_OWNERSHIP_LABEL = 'openai-agents-sandbox';
 const DOCKER_SESSION_IDENTITY_LABEL = 'openai-agents-sandbox.session-identity';
 const DOCKER_MOUNT_AUTHORITY_FINGERPRINT_LABEL =
   'openai-agents-sandbox.mount-authority-fingerprint';
+const DOCKER_PRIVILEGED_ENVIRONMENT = {
+  PATH: '/usr/sbin:/usr/bin:/sbin:/bin',
+  HOME: '/root',
+  LD_PRELOAD: '',
+  LD_LIBRARY_PATH: '',
+  LD_AUDIT: '',
+} as const;
 
-export interface DockerSandboxClientOptions extends SandboxClientOptions {
+function dockerUserMayBeRoot(user: string | undefined): boolean {
+  if (user === undefined) {
+    return true;
+  }
+  const userNameOrId = user.split(':', 1)[0];
+  return userNameOrId === 'root' || /^0+$/u.test(userNameOrId);
+}
+
+export interface DockerSandboxClientOptions
+  extends SandboxClientOptions, ProcessEnvironmentAccessOptions {
   image?: string;
   exposedPorts?: number[];
   workspaceBaseDir?: string;
@@ -406,6 +432,10 @@ export class DockerSandboxSession extends UnixLocalSandboxSession<DockerSandboxS
     manifest: Manifest,
     runAs?: string,
   ): Promise<void> {
+    assertProcessEnvironmentDestinationsPreserved(
+      this.state.manifest,
+      manifest,
+    );
     const previousManifest = this.state.manifest;
     const nextManifest = mergeManifestDelta(this.state.manifest, manifest);
     assertExistingMountTopologyPreserved(this.state.manifest, nextManifest);
@@ -467,10 +497,7 @@ export class DockerSandboxSession extends UnixLocalSandboxSession<DockerSandboxS
         }
       }
       await applyDockerInContainerMounts(this, manifest, preparedMounts);
-      const committedManifest = mergeDockerIdentityMetadata(
-        mergeManifestDelta(this.state.manifest, materializedManifest),
-        manifest,
-      );
+      const committedManifest = nextManifest;
       copyValidatedMountEffectivePaths(
         committedManifest,
         this.state.manifest,
@@ -582,7 +609,12 @@ export class DockerSandboxSession extends UnixLocalSandboxSession<DockerSandboxS
     if (args.tty) {
       dockerArgs.splice(2, 0, '-t');
     }
-    for (const [key, value] of Object.entries(this.state.environment)) {
+    for (const [key, value] of Object.entries(
+      environmentWithoutProcessEnvValues(
+        this.state.manifest,
+        this.state.environment,
+      ),
+    )) {
       dockerArgs.push('-e', `${key}=${value}`);
     }
     const runAs = args.runAs ?? this.state.defaultUser;
@@ -812,12 +844,17 @@ export class DockerSandboxSession extends UnixLocalSandboxSession<DockerSandboxS
   ): Promise<SandboxProcessResult> {
     this.assertSessionUsable();
     const dockerArgs = ['exec', '-i', '-w', '/'];
-    for (const [key, value] of Object.entries(
+    const runAs = options.runAs || this.state.defaultUser || undefined;
+    const environment = environmentWithoutProcessEnvValues(
+      this.state.manifest,
       options.environment ?? this.state.environment,
-    )) {
+    );
+    if (dockerUserMayBeRoot(runAs)) {
+      Object.assign(environment, DOCKER_PRIVILEGED_ENVIRONMENT);
+    }
+    for (const [key, value] of Object.entries(environment)) {
       dockerArgs.push('-e', `${key}=${value}`);
     }
-    const runAs = options.runAs ?? this.state.defaultUser;
     if (runAs) {
       dockerArgs.push('-u', runAs);
     }
@@ -827,30 +864,46 @@ export class DockerSandboxSession extends UnixLocalSandboxSession<DockerSandboxS
   }
 
   override async close(): Promise<void> {
-    let cleanupError: unknown;
-    if (!this.containerClosed) {
-      try {
-        await removeDockerContainer(this.state.containerId, {
-          ignoreMissing: true,
-        });
-        this.containerClosed = true;
-      } catch (error) {
-        cleanupError = error;
-      }
-    }
-    try {
-      await removeDockerVolumes(this.state.dockerVolumeNames ?? []);
-    } catch (error) {
-      cleanupError ??= error;
-    }
-    try {
-      await super.close();
-    } catch (error) {
-      cleanupError ??= error;
-    }
-    if (cleanupError) {
-      throw cleanupError;
-    }
+    await withProcessEnvironmentErrorRedaction(
+      this.state.manifest,
+      {
+        provider: 'docker',
+        operation: 'sandbox shutdown',
+        details: {
+          containerId: this.state.containerId,
+        },
+      },
+      async () => {
+        let cleanupError: unknown;
+        if (!this.containerClosed) {
+          try {
+            await removeDockerContainer(this.state.containerId, {
+              ignoreMissing: true,
+            });
+            this.containerClosed = true;
+          } catch (error) {
+            cleanupError = error;
+          }
+        }
+        try {
+          if (manifestHasProcessEnvValues(this.state.manifest)) {
+            await removeDockerVolumesStrict(this.state.dockerVolumeNames ?? []);
+          } else {
+            await removeDockerVolumes(this.state.dockerVolumeNames ?? []);
+          }
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        try {
+          await super.close();
+        } catch (error) {
+          cleanupError ??= error;
+        }
+        if (cleanupError) {
+          throw cleanupError;
+        }
+      },
+    );
   }
 
   private async invalidateAfterFailedPrivilegedManifestTransition(): Promise<void> {
@@ -986,13 +1039,21 @@ export class DockerSandboxClient implements SandboxClient<
     this.options = options;
   }
 
+  resolveTrustedManifestForResume(
+    manifest: Manifest,
+    options: DockerSandboxClientOptions = {},
+  ): Manifest {
+    return cloneManifestWithProcessEnvironmentAccess(manifest, {
+      ...this.options,
+      ...options,
+    });
+  }
+
   async create(
     args?: SandboxClientCreateArgs<DockerSandboxClientOptions> | Manifest,
     manifestOptions?: DockerSandboxClientOptions,
   ): Promise<DockerSandboxSession> {
     const createArgs = normalizeSandboxClientCreateArgs(args, manifestOptions);
-    const manifest = createArgs.manifest;
-    assertDockerManifestSupported(manifest);
     const resolvedOptions = {
       ...this.options,
       ...createArgs.options,
@@ -1006,123 +1067,205 @@ export class DockerSandboxClient implements SandboxClient<
         ? { archiveLimits: createArgs.archiveLimits }
         : {}),
     };
-    const environment = await manifest.resolveEnvironment();
-    validateMountEnvironmentCredentialBoundaries(manifest, environment);
-    await ensureDockerAvailable();
-    await this.retryFailedCreateCleanups();
-    const workspaceRootPath = await mkdtemp(
-      join(
-        resolvedOptions.workspaceBaseDir ?? tmpdir(),
-        'openai-agents-docker-sandbox-',
-      ),
+    const manifest = cloneManifestWithProcessEnvironmentAccess(
+      createArgs.manifest,
+      resolvedOptions,
     );
-
-    await materializeLocalWorkspaceManifest(manifest, workspaceRootPath, {
-      concurrencyLimits: resolvedOptions.concurrencyLimits,
-      allowLocalBindMounts: false,
-      allowIdentityMetadata: true,
-      supportsMount: isSupportedDockerCreateMount,
-      materializeMount: async ({ logicalPath, entry }) => {
-        await materializeDockerMountPoint(
-          workspaceRootPath,
-          manifest.root,
-          logicalPath,
-          entry,
-        );
-      },
-    });
-    await prepareDockerWorkspaceRoot(workspaceRootPath, manifest);
-    const image = resolvedOptions.image ?? DEFAULT_DOCKER_IMAGE;
-    const defaultUser = getHostDockerUser();
-    const configuredExposedPorts = normalizeExposedPorts(
-      resolvedOptions.exposedPorts,
-    );
-    const sessionIdentity = randomUUID();
-    const container = await startDockerContainer({
-      image,
+    assertDockerManifestSupported(manifest);
+    const lifecycleDetails: Record<string, unknown> = {};
+    return await withProcessEnvironmentErrorRedaction(
       manifest,
-      manifestRoot: manifest.root,
-      workspaceRootPath,
-      sessionIdentity,
-      environment,
-      defaultUser,
-      exposedPorts: configuredExposedPorts,
-    });
-    const session = new DockerSandboxSession({
-      state: {
-        sessionIdentity,
-        materializedEntriesFingerprint:
-          dockerMaterializedEntriesFingerprint(manifest),
-        manifest,
-        workspaceRootPath,
-        workspaceRootOwned: true,
-        environment,
-        snapshotSpec: resolvedOptions.snapshot ?? null,
-        snapshot: null,
-        image,
-        containerId: container.containerId,
-        defaultUser,
-        configuredExposedPorts,
-        dockerVolumeNames: container.volumeNames,
+      {
+        provider: 'docker',
+        operation: 'sandbox creation',
+        details: lifecycleDetails,
       },
-      archiveLimits: resolvedOptions.archiveLimits,
-    });
-    try {
-      await provisionDockerAccounts(container.containerId, manifest);
-      await applyDockerInContainerMounts(session, manifest);
-      captureLiveMountCredentialAuthority(manifest, environment);
-    } catch (error) {
-      const cleanupToken = {
-        containerId: container.containerId,
-        volumeNames: container.volumeNames,
-        workspaceRootPath,
-        removeWorkspace: true,
-      } satisfies StartedDockerCleanupToken;
-      this.failedCreateCleanupTokens.set(container.containerId, cleanupToken);
-      try {
-        await cleanupStartedDockerContainer(cleanupToken);
-        this.failedCreateCleanupTokens.delete(container.containerId);
-      } catch (cleanupError) {
-        throw new SandboxLifecycleError(
-          'Docker sandbox creation failed and cleanup could not complete.',
-          { errors: [error, cleanupError] },
+      async () => {
+        const environment = await manifest.resolveEnvironment();
+        validateMountEnvironmentCredentialBoundaries(manifest, environment);
+        await ensureDockerAvailable();
+        await this.retryFailedCreateCleanups(lifecycleDetails);
+        const workspaceRootPath = await mkdtemp(
+          join(
+            resolvedOptions.workspaceBaseDir ?? tmpdir(),
+            'openai-agents-docker-sandbox-',
+          ),
         );
-      }
-      throw error;
-    }
 
-    return session;
+        await materializeLocalWorkspaceManifest(manifest, workspaceRootPath, {
+          concurrencyLimits: resolvedOptions.concurrencyLimits,
+          allowLocalBindMounts: false,
+          allowIdentityMetadata: true,
+          supportsMount: isSupportedDockerCreateMount,
+          materializeMount: async ({ logicalPath, entry }) => {
+            await materializeDockerMountPoint(
+              workspaceRootPath,
+              manifest.root,
+              logicalPath,
+              entry,
+            );
+          },
+        });
+        await prepareDockerWorkspaceRoot(workspaceRootPath, manifest);
+        const image = resolvedOptions.image ?? DEFAULT_DOCKER_IMAGE;
+        const defaultUser = getHostDockerUser();
+        const configuredExposedPorts = normalizeExposedPorts(
+          resolvedOptions.exposedPorts,
+        );
+        const sessionIdentity = randomUUID();
+        const preparedContainer = await prepareDockerContainerStart({
+          image,
+          manifest,
+          manifestRoot: manifest.root,
+          workspaceRootPath,
+          sessionIdentity,
+          environment,
+          defaultUser,
+          exposedPorts: configuredExposedPorts,
+        });
+        const cleanupToken = {
+          containerId: preparedContainer.containerName,
+          volumeNames: preparedContainer.volumeNames,
+          workspaceRootPath,
+          removeWorkspace: true,
+          redactErrors: manifestHasProcessEnvValues(manifest),
+        } satisfies StartedDockerCleanupToken;
+        this.failedCreateCleanupTokens.set(
+          cleanupToken.containerId,
+          cleanupToken,
+        );
+        try {
+          const preparedContainerName = cleanupToken.containerId;
+          const container = await startDockerContainer(
+            preparedContainer,
+            manifest,
+          );
+          this.failedCreateCleanupTokens.delete(preparedContainerName);
+          cleanupToken.containerId = container.containerId;
+          this.failedCreateCleanupTokens.set(
+            cleanupToken.containerId,
+            cleanupToken,
+          );
+          const session = new DockerSandboxSession({
+            state: {
+              sessionIdentity,
+              materializedEntriesFingerprint:
+                dockerMaterializedEntriesFingerprint(manifest),
+              manifest,
+              workspaceRootPath,
+              workspaceRootOwned: true,
+              environment,
+              snapshotSpec: resolvedOptions.snapshot ?? null,
+              snapshot: null,
+              image,
+              containerId: container.containerId,
+              defaultUser,
+              configuredExposedPorts,
+              dockerVolumeNames: container.volumeNames,
+            },
+            archiveLimits: resolvedOptions.archiveLimits,
+          });
+          await provisionDockerAccounts(container.containerId, manifest);
+          await applyDockerInContainerMounts(session, manifest);
+          captureLiveMountCredentialAuthority(manifest, environment);
+          this.failedCreateCleanupTokens.delete(cleanupToken.containerId);
+          return session;
+        } catch (error) {
+          try {
+            await cleanupStartedDockerContainer(cleanupToken);
+            this.failedCreateCleanupTokens.delete(cleanupToken.containerId);
+          } catch (cleanupError) {
+            recordFailedDockerReplacementIdentifiers(
+              lifecycleDetails,
+              cleanupToken,
+            );
+            throw new SandboxLifecycleError(
+              'Docker sandbox creation failed and cleanup could not complete.',
+              { errors: [error, cleanupError] },
+            );
+          }
+          throw error;
+        }
+      },
+    );
   }
 
   async resume(
     state: DockerSandboxSessionState,
     options: SandboxClientResumeOptions = {},
   ): Promise<DockerSandboxSession> {
-    assertMountCredentialsRebound(state);
-    assertHostPathGrantsRebound(state);
-    assertDockerManifestSupported(state.manifest);
-    validateMountEnvironmentCredentialBoundaries(
-      state.manifest,
-      state.environment,
+    const processEnvironmentOptions = this.processEnvironmentOptionsForState(
+      state,
+      options.clientOptions,
     );
-    await ensureDockerAvailable();
-    await this.retryFailedCreateCleanups();
+    const manifest = cloneManifestWithProcessEnvironmentAccess(
+      state.manifest,
+      processEnvironmentOptions,
+    );
+    state.manifest = manifest;
+    const hasProtectedProcessEnvironment =
+      manifestHasProcessEnvValues(manifest);
+    const resumeState = hasProtectedProcessEnvironment
+      ? { ...state, manifest }
+      : state;
+    const previousContainerId = state.containerId;
+    const lifecycleDetails: Record<string, unknown> = {
+      containerId: previousContainerId,
+    };
+    assertMountCredentialsRebound(resumeState);
+    assertHostPathGrantsRebound(resumeState);
+    assertDockerManifestSupported(manifest);
     const archiveLimits =
       options.archiveLimits === undefined
         ? this.options.archiveLimits
         : options.archiveLimits;
-    const restoredState = await this.restoreIfNeeded(state, archiveLimits);
+    return await withProcessEnvironmentErrorRedaction(
+      manifest,
+      {
+        provider: 'docker',
+        operation: 'sandbox resume',
+        details: lifecycleDetails,
+      },
+      async () => {
+        if (hasProtectedProcessEnvironment) {
+          resumeState.environment = {
+            ...environmentWithoutProcessEnvValues(
+              manifest,
+              resumeState.environment,
+            ),
+            ...(await manifest.resolveEnvironment()),
+          };
+        }
+        validateMountEnvironmentCredentialBoundaries(
+          manifest,
+          resumeState.environment,
+        );
+        await ensureDockerAvailable();
+        await this.retryFailedCreateCleanups(lifecycleDetails);
+        const restoredState = await this.restoreIfNeeded(
+          resumeState,
+          archiveLimits,
+          hasProtectedProcessEnvironment,
+          {
+            lifecycleDetails,
+          },
+        );
 
-    return new DockerSandboxSession({
-      state: restoredState,
-      archiveLimits,
-    });
+        return new DockerSandboxSession({
+          state: restoredState,
+          archiveLimits,
+        });
+      },
+    );
   }
 
   async canReusePreservedOwnedSession(
     state: DockerSandboxSessionState,
     options: SandboxPreservedSessionReuseOptions<DockerSandboxClientOptions> = {},
   ): Promise<boolean> {
+    if (manifestHasProcessEnvValues(state.manifest)) {
+      return false;
+    }
     if (isSandboxSessionStateUnsafe(state)) {
       return false;
     }
@@ -1233,24 +1376,47 @@ export class DockerSandboxClient implements SandboxClient<
   async deserializeSessionState(
     state: Record<string, unknown>,
   ): Promise<DockerSandboxSessionState> {
-    const baseState = await deserializeLocalSandboxSessionStateValues(
-      state,
-      this.options.snapshot,
-    );
-    return {
-      ...baseState,
-      sessionIdentity: readOptionalString(state, 'sessionIdentity'),
-      image: readString(state, 'image'),
-      containerId: readString(state, 'containerId'),
-      defaultUser:
-        readOptionalString(state, 'defaultUser') ?? getHostDockerUser(),
-      dockerVolumeNames: readStringArray(state.dockerVolumeNames),
+    const trustedConfig = getRunStateSessionTrustedConfig(state);
+    const resolvedOptions = {
+      ...this.options,
+      ...(trustedConfig?.clientOptions as
+        DockerSandboxClientOptions | undefined),
     };
+    const manifest = bindProcessEnvironmentAccess(
+      deserializeManifest(
+        state.manifest as Record<string, unknown> | undefined,
+      ),
+      resolvedOptions,
+    );
+    return await withProcessEnvironmentErrorRedaction(
+      manifest,
+      { provider: 'docker', operation: 'sandbox state deserialization' },
+      async () => {
+        const baseState = await deserializeLocalSandboxSessionStateValues(
+          state,
+          resolvedOptions.snapshot,
+          () => manifest,
+        );
+        return {
+          ...baseState,
+          sessionIdentity: readOptionalString(state, 'sessionIdentity'),
+          image: readString(state, 'image'),
+          containerId: readString(state, 'containerId'),
+          defaultUser:
+            readOptionalString(state, 'defaultUser') ?? getHostDockerUser(),
+          dockerVolumeNames: readStringArray(state.dockerVolumeNames),
+        };
+      },
+    );
   }
 
   private async restoreIfNeeded(
     state: DockerSandboxSessionState,
     archiveLimits?: SandboxArchiveLimits | null,
+    forceProcessEnvironmentReplacement = false,
+    protectedReplacement?: {
+      lifecycleDetails: Record<string, unknown>;
+    },
   ): Promise<DockerSandboxSessionState> {
     attachDockerSnapshotExcludedPaths(state);
     if (isRunStateSessionState(state)) {
@@ -1287,10 +1453,27 @@ export class DockerSandboxClient implements SandboxClient<
         trustedState,
         archiveLimits,
         resolvedOptions.workspaceBaseDir,
+        protectedReplacement?.lifecycleDetails,
       );
     }
-    const containerRunning = await inspectContainerRunning(state.containerId);
+    const containerStatus = await inspectDockerContainerStatus(
+      state.containerId,
+    );
+    const containerRunning = containerStatus === 'running';
     const workspaceExists = await pathExists(state.workspaceRootPath);
+
+    if (forceProcessEnvironmentReplacement) {
+      if (!protectedReplacement) {
+        throw new Error('Protected Docker replacement context is required.');
+      }
+      return await this.replaceProtectedDockerState(
+        state,
+        containerStatus,
+        workspaceExists,
+        protectedReplacement,
+        archiveLimits,
+      );
+    }
 
     if (workspaceExists) {
       if (containerRunning) {
@@ -1354,10 +1537,111 @@ export class DockerSandboxClient implements SandboxClient<
     return await this.restoreSnapshotIntoNewWorkspace(state, archiveLimits);
   }
 
+  private async replaceProtectedDockerState(
+    state: DockerSandboxSessionState,
+    containerStatus: DockerContainerStatus,
+    workspaceExists: boolean,
+    protectedReplacement: {
+      lifecycleDetails: Record<string, unknown>;
+    },
+    archiveLimits?: SandboxArchiveLimits | null,
+  ): Promise<DockerSandboxSessionState> {
+    let authenticatedPrevious:
+      { containerId: string; dockerVolumeNames: string[] } | undefined;
+    if (containerStatus !== 'missing') {
+      const inspection = await inspectRunningDockerContainerForReuse(state);
+      const canonicalContainerId = await inspectDockerCanonicalContainerId(
+        state.containerId,
+      );
+      if (
+        !inspection.ownershipVerified ||
+        !inspection.dockerVolumeNames ||
+        !canonicalContainerId
+      ) {
+        throw new UserError(
+          'Docker sandbox resource ownership could not be verified. Refusing to replace the container.',
+        );
+      }
+      authenticatedPrevious = {
+        containerId: canonicalContainerId,
+        dockerVolumeNames: inspection.dockerVolumeNames,
+      };
+    }
+
+    let replacement: DockerSandboxSessionState;
+    if (workspaceExists && (await canReuseLocalSnapshotWorkspace(state))) {
+      replacement = await this.restartContainer(
+        state,
+        state.workspaceRootPath,
+        archiveLimits,
+        protectedReplacement.lifecycleDetails,
+      );
+    } else {
+      if (!(await localSnapshotIsRestorable(state))) {
+        throw new UserError(
+          'Docker sandbox resources are unavailable and no local snapshot could be restored.',
+        );
+      }
+      if (authenticatedPrevious) {
+        replacement = await this.restoreSnapshotIntoNewWorkspace(
+          state,
+          archiveLimits,
+          this.options.workspaceBaseDir,
+          protectedReplacement.lifecycleDetails,
+        );
+      } else if (workspaceExists) {
+        const restoredState = await restoreLocalSnapshotToWorkspace(
+          state,
+          state.workspaceRootPath,
+          { archiveLimits },
+        );
+        replacement = await this.restartContainer(
+          restoredState,
+          restoredState.workspaceRootPath,
+          archiveLimits,
+          protectedReplacement.lifecycleDetails,
+        );
+      } else {
+        replacement = await this.restoreSnapshotIntoNewWorkspace(
+          state,
+          archiveLimits,
+          this.options.workspaceBaseDir,
+          protectedReplacement.lifecycleDetails,
+        );
+      }
+    }
+
+    if (!authenticatedPrevious) {
+      return replacement;
+    }
+    return await this.retireProtectedDockerResources(
+      state,
+      replacement,
+      authenticatedPrevious,
+      protectedReplacement.lifecycleDetails,
+    );
+  }
+
+  private processEnvironmentOptionsForState(
+    state: DockerSandboxSessionState,
+    clientOptions?: DockerSandboxClientOptions,
+  ): ProcessEnvironmentAccessOptions {
+    const trustedConfig = isRunStateSessionState(state)
+      ? getRunStateSessionTrustedConfig(state)
+      : undefined;
+    return {
+      ...this.options,
+      ...(trustedConfig?.clientOptions as
+        DockerSandboxClientOptions | undefined),
+      ...clientOptions,
+    };
+  }
+
   private async restoreSnapshotIntoNewWorkspace(
     state: DockerSandboxSessionState,
     archiveLimits?: SandboxArchiveLimits | null,
     workspaceBaseDir = this.options.workspaceBaseDir,
+    lifecycleDetails?: Record<string, unknown>,
   ): Promise<DockerSandboxSessionState> {
     const workspaceRootPath = await mkdtemp(
       join(workspaceBaseDir ?? tmpdir(), 'openai-agents-docker-sandbox-'),
@@ -1376,6 +1660,7 @@ export class DockerSandboxClient implements SandboxClient<
         restoredState,
         workspaceRootPath,
         archiveLimits,
+        lifecycleDetails,
       );
     } catch (error) {
       await rm(workspaceRootPath, { recursive: true, force: true }).catch(
@@ -1392,10 +1677,45 @@ export class DockerSandboxClient implements SandboxClient<
     await removeDockerVolumes(state.dockerVolumeNames ?? []);
   }
 
+  private async retireProtectedDockerResources(
+    previous: DockerSandboxSessionState,
+    replacement: DockerSandboxSessionState,
+    authenticatedPrevious: {
+      containerId: string;
+      dockerVolumeNames: string[];
+    },
+    lifecycleDetails: Record<string, unknown>,
+  ): Promise<DockerSandboxSessionState> {
+    try {
+      await cleanupProtectedDockerResources(
+        authenticatedPrevious.containerId,
+        authenticatedPrevious.dockerVolumeNames,
+      );
+      if (
+        previous.workspaceRootOwned &&
+        previous.workspaceRootPath !== replacement.workspaceRootPath
+      ) {
+        await rm(previous.workspaceRootPath, { recursive: true, force: true });
+      }
+    } catch (retirementError) {
+      lifecycleDetails.previousContainerId = authenticatedPrevious.containerId;
+      lifecycleDetails.previousDockerVolumeNames = [
+        ...authenticatedPrevious.dockerVolumeNames,
+      ];
+      lifecycleDetails.replacementContainerId = replacement.containerId;
+      lifecycleDetails.replacementDockerVolumeNames = [
+        ...(replacement.dockerVolumeNames ?? []),
+      ];
+      throw retirementError;
+    }
+    return replacement;
+  }
+
   private async restartContainer(
     state: DockerSandboxSessionState,
     workspaceRootPath: string,
     archiveLimits?: SandboxArchiveLimits | null,
+    lifecycleDetails?: Record<string, unknown>,
   ): Promise<DockerSandboxSessionState> {
     await materializeLocalWorkspaceManifestMounts(
       state.manifest,
@@ -1416,7 +1736,7 @@ export class DockerSandboxClient implements SandboxClient<
     );
     await prepareDockerWorkspaceRoot(workspaceRootPath, state.manifest);
     const sessionIdentity = state.sessionIdentity ?? randomUUID();
-    const container = await startDockerContainer({
+    const preparedContainer = await prepareDockerContainerStart({
       image: state.image,
       manifest: state.manifest,
       manifestRoot: state.manifest.root,
@@ -1426,36 +1746,54 @@ export class DockerSandboxClient implements SandboxClient<
       defaultUser: state.defaultUser,
       exposedPorts: state.configuredExposedPorts,
     });
-    const nextState = {
-      ...state,
-      sessionIdentity,
-      materializedEntriesFingerprint: dockerMaterializedEntriesFingerprint(
-        state.manifest,
-      ),
-      workspaceRootPath,
-      containerId: container.containerId,
-      dockerVolumeNames: container.volumeNames,
-      exposedPorts: undefined,
-    };
-    const session = new DockerSandboxSession({
-      state: nextState,
-      archiveLimits,
-    });
     const cleanupToken = {
-      containerId: container.containerId,
-      volumeNames: container.volumeNames,
+      containerId: preparedContainer.containerName,
+      volumeNames: preparedContainer.volumeNames,
       workspaceRootPath,
       removeWorkspace: false,
+      redactErrors: manifestHasProcessEnvValues(state.manifest),
     } satisfies StartedDockerCleanupToken;
-    this.failedCreateCleanupTokens.set(container.containerId, cleanupToken);
+    this.failedCreateCleanupTokens.set(cleanupToken.containerId, cleanupToken);
     try {
+      const preparedContainerName = cleanupToken.containerId;
+      const container = await startDockerContainer(
+        preparedContainer,
+        state.manifest,
+      );
+      this.failedCreateCleanupTokens.delete(preparedContainerName);
+      cleanupToken.containerId = container.containerId;
+      this.failedCreateCleanupTokens.set(
+        cleanupToken.containerId,
+        cleanupToken,
+      );
+      const nextState = {
+        ...state,
+        sessionIdentity,
+        materializedEntriesFingerprint: dockerMaterializedEntriesFingerprint(
+          state.manifest,
+        ),
+        workspaceRootPath,
+        containerId: container.containerId,
+        dockerVolumeNames: container.volumeNames,
+        exposedPorts: undefined,
+      };
+      const session = new DockerSandboxSession({
+        state: nextState,
+        archiveLimits,
+      });
       await provisionDockerAccounts(container.containerId, state.manifest);
       await applyDockerInContainerMounts(session, state.manifest);
+      this.failedCreateCleanupTokens.delete(cleanupToken.containerId);
+      return nextState;
     } catch (error) {
       try {
         await cleanupStartedDockerContainer(cleanupToken);
-        this.failedCreateCleanupTokens.delete(container.containerId);
+        this.failedCreateCleanupTokens.delete(cleanupToken.containerId);
       } catch (cleanupError) {
+        recordFailedDockerReplacementIdentifiers(
+          lifecycleDetails,
+          cleanupToken,
+        );
         throw new SandboxLifecycleError(
           'Docker sandbox restart failed and cleanup could not complete.',
           { errors: [error, cleanupError] },
@@ -1463,13 +1801,33 @@ export class DockerSandboxClient implements SandboxClient<
       }
       throw error;
     }
-    this.failedCreateCleanupTokens.delete(container.containerId);
-    return nextState;
   }
 
-  private async retryFailedCreateCleanups(): Promise<void> {
+  private async retryFailedCreateCleanups(
+    lifecycleDetails?: Record<string, unknown>,
+  ): Promise<void> {
     for (const [containerId, cleanupToken] of this.failedCreateCleanupTokens) {
-      await cleanupStartedDockerContainer(cleanupToken);
+      try {
+        await cleanupStartedDockerContainer(cleanupToken);
+      } catch (error) {
+        if (!cleanupToken.redactErrors) {
+          throw error;
+        }
+        recordFailedDockerReplacementIdentifiers(
+          lifecycleDetails,
+          cleanupToken,
+        );
+        throw new SandboxLifecycleError(
+          'Docker sandbox cleanup failed for a resource that used protected process environment values.',
+          {
+            provider: 'docker',
+            operation: 'deferred cleanup',
+            containerId,
+            replacementContainerId: cleanupToken.containerId,
+            replacementDockerVolumeNames: [...cleanupToken.volumeNames],
+          },
+        );
+      }
       this.failedCreateCleanupTokens.delete(containerId);
     }
   }
@@ -1480,18 +1838,39 @@ type StartedDockerCleanupToken = {
   volumeNames: string[];
   workspaceRootPath: string;
   removeWorkspace: boolean;
+  redactErrors: boolean;
 };
+
+function recordFailedDockerReplacementIdentifiers(
+  details: Record<string, unknown> | undefined,
+  cleanupToken: StartedDockerCleanupToken,
+): void {
+  if (!details || !cleanupToken.redactErrors) {
+    return;
+  }
+  details.replacementContainerId = cleanupToken.containerId;
+  details.replacementDockerVolumeNames = [...cleanupToken.volumeNames];
+}
 
 async function cleanupStartedDockerContainer(
   args: StartedDockerCleanupToken,
 ): Promise<void> {
   let containerRemovalError: unknown;
+  let volumeRemovalError: unknown;
   try {
     await removeDockerContainer(args.containerId, { ignoreMissing: true });
   } catch (error) {
     containerRemovalError = error;
   }
-  await removeDockerVolumes(args.volumeNames);
+  try {
+    if (args.redactErrors) {
+      await removeDockerVolumesStrict(args.volumeNames);
+    } else {
+      await removeDockerVolumes(args.volumeNames);
+    }
+  } catch (error) {
+    volumeRemovalError = error;
+  }
   if (args.removeWorkspace) {
     await rm(args.workspaceRootPath, { recursive: true, force: true }).catch(
       () => undefined,
@@ -1499,6 +1878,9 @@ async function cleanupStartedDockerContainer(
   }
   if (containerRemovalError) {
     throw containerRemovalError;
+  }
+  if (volumeRemovalError) {
+    throw volumeRemovalError;
   }
 }
 
@@ -1518,6 +1900,17 @@ async function resolveDockerRunStateEnvironment(
 }
 
 function assertDockerManifestSupported(manifest: Manifest): void {
+  for (const key of ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT']) {
+    if (manifest.environment[key] instanceof ProcessEnvValue) {
+      throw new SandboxUnsupportedFeatureError(
+        `DockerSandboxClient does not support ProcessEnvValue for "${key}" because trusted path resolution must clear dynamic-loader environment variables. Use an ordinary explicit environment value or a different protected destination name.`,
+        {
+          provider: 'DockerSandboxClient',
+          feature: `manifest.environment.${key}`,
+        },
+      );
+    }
+  }
   validateMountCredentialBoundaries(manifest);
   assertDockerManifestRootSupported(manifest);
   for (const grant of manifest.extraPathGrants) {
@@ -1537,6 +1930,7 @@ function assertDockerManifestSupported(manifest: Manifest): void {
 type DockerContainerReuseInspection = {
   ownershipVerified: boolean;
   reusable: boolean;
+  dockerVolumeNames?: string[];
 };
 
 async function inspectRunningDockerContainerForReuse(
@@ -1563,7 +1957,7 @@ async function inspectRunningDockerContainerForReuse(
   const manifestBindMountsBeforeInspect = await resolveDockerManifestBindMounts(
     state.manifest,
   );
-  const actualBindMounts = await inspectDockerBindMounts(state.containerId);
+  const actualMounts = await inspectDockerContainerMounts(state.containerId);
 
   const workspaceMountAfterInspect = await resolveDockerWorkspaceMount(
     state.workspaceRootPath,
@@ -1575,14 +1969,14 @@ async function inspectRunningDockerContainerForReuse(
   const manifestBindMountsAfterInspect = await resolveDockerManifestBindMounts(
     state.manifest,
   );
-  if (!actualBindMounts) {
+  if (!actualMounts) {
     return { ownershipVerified: false, reusable: false };
   }
 
   const expectedWorkspaceMount = dockerBindMountsFromAuthority([
     workspaceMountAfterInspect,
   ])[0]!;
-  const ownershipVerified = actualBindMounts.some((mount) =>
+  const ownershipVerified = actualMounts.bindMounts.some((mount) =>
     dockerBindMountsEqual(mount, expectedWorkspaceMount),
   );
   if (!ownershipVerified) {
@@ -1594,9 +1988,13 @@ async function inspectRunningDockerContainerForReuse(
     ...pathGrantMountsAfterInspect,
     ...manifestBindMountsAfterInspect,
   ]);
+  const dockerVolumeNames = verifiedDockerVolumeNames(
+    state.manifest,
+    actualMounts.volumeMounts,
+  );
   const recordedFingerprint = labels[DOCKER_MOUNT_AUTHORITY_FINGERPRINT_LABEL];
   if (recordedFingerprint === undefined) {
-    return { ownershipVerified: true, reusable: false };
+    return { ownershipVerified: true, reusable: false, dockerVolumeNames };
   }
   const fingerprintBeforeInspect = dockerMountAuthorityFingerprint(
     sessionIdentity,
@@ -1614,10 +2012,12 @@ async function inspectRunningDockerContainerForReuse(
   );
   return {
     ownershipVerified: true,
+    dockerVolumeNames,
     reusable:
+      dockerVolumeNames !== undefined &&
       fingerprintBeforeInspect === fingerprintAfterInspect &&
       recordedFingerprint === fingerprintAfterInspect &&
-      dockerBindMountSetsEqual(actualBindMounts, expectedBindMounts),
+      dockerBindMountSetsEqual(actualMounts.bindMounts, expectedBindMounts),
   };
 }
 
@@ -1640,7 +2040,7 @@ async function inspectLegacyDockerContainerForReuse(
   const manifestBindMountsBeforeInspect = await resolveDockerManifestBindMounts(
     state.manifest,
   );
-  const actualBindMounts = await inspectDockerBindMounts(state.containerId);
+  const actualMounts = await inspectDockerContainerMounts(state.containerId);
   const workspaceMountAfterInspect = await resolveDockerWorkspaceMount(
     state.workspaceRootPath,
     state.manifest.root,
@@ -1648,20 +2048,26 @@ async function inspectLegacyDockerContainerForReuse(
   const manifestBindMountsAfterInspect = await resolveDockerManifestBindMounts(
     state.manifest,
   );
-  if (!actualBindMounts) {
+  if (!actualMounts) {
     return { ownershipVerified: false, reusable: false };
   }
 
   const expectedWorkspaceMount = dockerBindMountsFromAuthority([
     workspaceMountAfterInspect,
   ])[0]!;
-  const ownershipVerified = actualBindMounts.some((mount) =>
+  const ownershipVerified = actualMounts.bindMounts.some((mount) =>
     dockerBindMountsEqual(mount, expectedWorkspaceMount),
+  );
+  const dockerVolumeNames = verifiedDockerVolumeNames(
+    state.manifest,
+    actualMounts.volumeMounts,
   );
   return {
     ownershipVerified,
+    dockerVolumeNames,
     reusable:
       ownershipVerified &&
+      dockerVolumeNames !== undefined &&
       dockerMountAuthoritiesEqual(
         workspaceMountBeforeInspect,
         workspaceMountAfterInspect,
@@ -1671,7 +2077,7 @@ async function inspectLegacyDockerContainerForReuse(
         manifestBindMountsAfterInspect,
       ) &&
       state.manifest.extraPathGrants.length === 0 &&
-      dockerBindMountSetsEqual(actualBindMounts, [
+      dockerBindMountSetsEqual(actualMounts.bindMounts, [
         expectedWorkspaceMount,
         ...dockerBindMountsFromAuthority(manifestBindMountsAfterInspect),
       ]),
@@ -1730,6 +2136,7 @@ function sortDockerMountAuthorities(
 type DockerInspectMount = {
   Type?: unknown;
   Source?: unknown;
+  Name?: unknown;
   Destination?: unknown;
   RW?: unknown;
 };
@@ -1738,6 +2145,16 @@ type DockerBindMount = {
   source: string;
   target: string;
   readWrite: boolean;
+};
+
+type DockerVolumeMount = {
+  name: string;
+  target: string;
+};
+
+type DockerContainerMounts = {
+  bindMounts: DockerBindMount[];
+  volumeMounts: DockerVolumeMount[];
 };
 
 type DockerMountAuthority = {
@@ -1783,9 +2200,9 @@ async function inspectDockerContainerLabels(
   }
 }
 
-async function inspectDockerBindMounts(
+async function inspectDockerContainerMounts(
   containerId: string,
-): Promise<DockerBindMount[] | undefined> {
+): Promise<DockerContainerMounts | undefined> {
   const result = await runSandboxProcess(
     'docker',
     [
@@ -1808,32 +2225,64 @@ async function inspectDockerBindMounts(
     if (!Array.isArray(mounts)) {
       return undefined;
     }
-    return await Promise.all(
-      mounts
-        .filter(
-          (mount): mount is DockerInspectMount =>
-            typeof mount === 'object' &&
-            mount !== null &&
-            (mount as DockerInspectMount).Type === 'bind',
-        )
-        .map(async (mount): Promise<DockerBindMount> => {
-          if (
-            typeof mount.Source !== 'string' ||
-            typeof mount.Destination !== 'string' ||
-            typeof mount.RW !== 'boolean'
-          ) {
-            throw new Error('Invalid Docker bind mount inspection result.');
-          }
-          return {
-            source: await realpath(mount.Source),
-            target: mount.Destination,
-            readWrite: mount.RW,
-          };
-        }),
-    );
+    const bindMounts: DockerBindMount[] = [];
+    const volumeMounts: DockerVolumeMount[] = [];
+    for (const value of mounts) {
+      if (typeof value !== 'object' || value === null) {
+        continue;
+      }
+      const mount = value as DockerInspectMount;
+      if (mount.Type === 'bind') {
+        if (
+          typeof mount.Source !== 'string' ||
+          typeof mount.Destination !== 'string' ||
+          typeof mount.RW !== 'boolean'
+        ) {
+          throw new Error('Invalid Docker bind mount inspection result.');
+        }
+        bindMounts.push({
+          source: await realpath(mount.Source),
+          target: mount.Destination,
+          readWrite: mount.RW,
+        });
+      } else if (mount.Type === 'volume') {
+        if (
+          typeof mount.Name !== 'string' ||
+          typeof mount.Destination !== 'string'
+        ) {
+          throw new Error('Invalid Docker volume mount inspection result.');
+        }
+        volumeMounts.push({
+          name: mount.Name,
+          target: mount.Destination,
+        });
+      }
+    }
+    return { bindMounts, volumeMounts };
   } catch {
     return undefined;
   }
+}
+
+function verifiedDockerVolumeNames(
+  manifest: Manifest,
+  actualVolumeMounts: DockerVolumeMount[],
+): string[] | undefined {
+  const expectedTargets = manifest
+    .mountTargetsForMaterialization()
+    .filter(({ entry }) => isDockerVolumeMount(entry))
+    .map(({ mountPath }) => mountPath)
+    .sort();
+  const sortedActual = [...actualVolumeMounts].sort((left, right) =>
+    left.target.localeCompare(right.target),
+  );
+  if (
+    sortedActual.length !== expectedTargets.length ||
+    sortedActual.some((mount, index) => mount.target !== expectedTargets[index])
+  ) {
+    return undefined;
+  }
+  return sortedActual.map((mount) => mount.name);
 }
 
 function dockerBindMountsEqual(
@@ -2073,9 +2522,21 @@ async function provisionDockerAccounts(
   manifest: Manifest,
 ): Promise<void> {
   for (const command of dockerAccountProvisionCommands(manifest)) {
+    const environmentArgs = Object.entries(
+      DOCKER_PRIVILEGED_ENVIRONMENT,
+    ).flatMap(([key, value]) => ['-e', `${key}=${value}`]);
     const result = await runSandboxProcess(
       'docker',
-      ['exec', '-u', 'root', containerId, '/bin/sh', '-c', command],
+      [
+        'exec',
+        ...environmentArgs,
+        '-u',
+        'root',
+        containerId,
+        '/bin/sh',
+        '-c',
+        command,
+      ],
       {
         timeoutMs: DOCKER_FAST_COMMAND_TIMEOUT_MS,
       },
@@ -2136,20 +2597,8 @@ function stripDockerIdentityMetadata(manifest: Manifest): Manifest {
     remoteMountCommandAllowlist: manifest.remoteMountCommandAllowlist,
   });
   copyManifestMountCredentialExposurePolicy(stripped, manifest);
+  copyProcessEnvironmentProtection(stripped, manifest);
   return stripped;
-}
-
-function mergeDockerIdentityMetadata(
-  current: Manifest,
-  delta: Manifest,
-): Manifest {
-  return mergeManifestDelta(
-    current,
-    new Manifest({
-      users: delta.users,
-      groups: delta.groups,
-    }),
-  );
 }
 
 async function ensureDockerAvailable(): Promise<void> {
@@ -2164,7 +2613,11 @@ async function ensureDockerAvailable(): Promise<void> {
   }
 }
 
-async function inspectContainerRunning(containerId: string): Promise<boolean> {
+type DockerContainerStatus = 'running' | 'stopped' | 'missing';
+
+async function inspectDockerContainerStatus(
+  containerId: string,
+): Promise<DockerContainerStatus> {
   const result = await runSandboxProcess(
     'docker',
     [
@@ -2182,7 +2635,7 @@ async function inspectContainerRunning(containerId: string): Promise<boolean> {
 
   if (result.status !== 0) {
     if (isMissingDockerContainerError(result)) {
-      return false;
+      return 'missing';
     }
     throw new UserError(
       `Failed to inspect Docker sandbox container: ${formatSandboxProcessError(result)}`,
@@ -2190,14 +2643,32 @@ async function inspectContainerRunning(containerId: string): Promise<boolean> {
   }
   const running = result.stdout.trim();
   if (running === 'true') {
-    return true;
+    return 'running';
   }
   if (running === 'false') {
-    return false;
+    return 'stopped';
   }
   throw new UserError(
     `Failed to inspect Docker sandbox container: unexpected running state "${running}".`,
   );
+}
+
+async function inspectContainerRunning(containerId: string): Promise<boolean> {
+  return (await inspectDockerContainerStatus(containerId)) === 'running';
+}
+
+async function inspectDockerCanonicalContainerId(
+  containerId: string,
+): Promise<string | undefined> {
+  const result = await runSandboxProcess(
+    'docker',
+    ['inspect', '--type', 'container', '--format', '{{.Id}}', containerId],
+    { timeoutMs: DOCKER_FAST_COMMAND_TIMEOUT_MS },
+  );
+  if (result.status !== 0) {
+    return undefined;
+  }
+  return result.stdout.trim() || undefined;
 }
 
 async function runDockerProcess(
@@ -2263,7 +2734,7 @@ function isMissingDockerContainerError(result: SandboxProcessResult): boolean {
   );
 }
 
-async function startDockerContainer(args: {
+type DockerContainerStartOptions = {
   image: string;
   manifest: Manifest;
   manifestRoot: string;
@@ -2272,7 +2743,17 @@ async function startDockerContainer(args: {
   environment: Record<string, string>;
   defaultUser?: string;
   exposedPorts?: number[];
-}): Promise<{ containerId: string; volumeNames: string[] }> {
+};
+
+type PreparedDockerContainerStart = {
+  containerName: string;
+  volumeNames: string[];
+  processArgs: string[];
+};
+
+async function prepareDockerContainerStart(
+  args: DockerContainerStartOptions,
+): Promise<PreparedDockerContainerStart> {
   const envArgs = Object.entries(args.environment).flatMap(([key, value]) => [
     '-e',
     `${key}=${value}`,
@@ -2297,9 +2778,10 @@ async function startDockerContainer(args: {
     manifestBindMounts,
   );
   const privilegeArgs = dockerInContainerMountPrivilegeArgs(args.manifest);
-  const result = await runSandboxProcess(
-    'docker',
-    [
+  return {
+    containerName,
+    volumeNames,
+    processArgs: [
       'run',
       '-d',
       '--name',
@@ -2325,12 +2807,23 @@ async function startDockerContainer(args: {
       '-c',
       DEFAULT_CONTAINER_COMMAND,
     ],
-    {
-      timeoutMs: DOCKER_CONTAINER_START_TIMEOUT_MS,
-    },
-  );
+  };
+}
+
+async function startDockerContainer(
+  prepared: PreparedDockerContainerStart,
+  manifest: Manifest,
+): Promise<{ containerId: string; volumeNames: string[] }> {
+  const result = await runSandboxProcess('docker', prepared.processArgs, {
+    timeoutMs: DOCKER_CONTAINER_START_TIMEOUT_MS,
+  });
 
   if (result.status !== 0) {
+    if (manifestHasProcessEnvValues(manifest)) {
+      throw new UserError(
+        `Failed to start Docker sandbox container with exit status ${result.status}.`,
+      );
+    }
     throw new UserError(
       `Failed to start Docker sandbox container: ${formatSandboxProcessError(result)}`,
     );
@@ -2338,7 +2831,7 @@ async function startDockerContainer(args: {
 
   return {
     containerId: result.stdout.trim(),
-    volumeNames,
+    volumeNames: prepared.volumeNames,
   };
 }
 
@@ -2745,7 +3238,12 @@ async function resolveTrustedDockerPath(
 ): Promise<string> {
   const dockerArgs = ['exec', '-i', '-w', '/'];
   const clearedEnvironment = new Set([
-    ...Object.keys(session.state.environment),
+    ...Object.keys(
+      environmentWithoutProcessEnvValues(
+        session.state.manifest,
+        session.state.environment,
+      ),
+    ),
     'LD_PRELOAD',
     'LD_LIBRARY_PATH',
     'LD_AUDIT',
@@ -2753,11 +3251,10 @@ async function resolveTrustedDockerPath(
   for (const key of clearedEnvironment) {
     dockerArgs.push('-e', `${key}=`);
   }
+  for (const [key, value] of Object.entries(DOCKER_PRIVILEGED_ENVIRONMENT)) {
+    dockerArgs.push('-e', `${key}=${value}`);
+  }
   dockerArgs.push(
-    '-e',
-    'PATH=/usr/bin:/bin',
-    '-e',
-    'HOME=/root',
     '-u',
     'root',
     session.state.containerId,
@@ -4540,6 +5037,53 @@ async function removeDockerVolumes(volumeNames: string[]): Promise<void> {
       }).catch(() => undefined);
     }),
   );
+}
+
+async function removeDockerVolumesStrict(volumeNames: string[]): Promise<void> {
+  const results = await Promise.all(
+    volumeNames.map(async (volumeName) => {
+      try {
+        const result = await runSandboxProcess(
+          'docker',
+          ['volume', 'rm', '-f', volumeName],
+          { timeoutMs: DOCKER_FAST_COMMAND_TIMEOUT_MS },
+        );
+        return result.status === 0 || isMissingDockerVolumeError(result);
+      } catch {
+        return false;
+      }
+    }),
+  );
+  if (results.some((removed) => !removed)) {
+    throw new UserError('Failed to remove Docker sandbox volumes.');
+  }
+}
+
+function isMissingDockerVolumeError(result: SandboxProcessResult): boolean {
+  const message = formatSandboxProcessError(result).toLowerCase();
+  return (
+    message.includes('no such volume') || message.includes('no such object')
+  );
+}
+
+async function cleanupProtectedDockerResources(
+  containerId: string,
+  volumeNames: string[],
+): Promise<void> {
+  let cleanupError: unknown;
+  try {
+    await removeDockerContainer(containerId, { ignoreMissing: true });
+  } catch (error) {
+    cleanupError = error;
+  }
+  try {
+    await removeDockerVolumesStrict(volumeNames);
+  } catch (error) {
+    cleanupError ??= error;
+  }
+  if (cleanupError) {
+    throw cleanupError;
+  }
 }
 
 function dockerRcloneS3Options(entry: S3Mount): Record<string, string> {

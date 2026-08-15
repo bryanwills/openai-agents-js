@@ -1,12 +1,25 @@
 import {
+  addSandboxEventSink,
   boxMount,
+  clearSandboxEventSinks,
+  cloneManifest,
+  EnvValueReference,
   Manifest,
+  ProcessEnvValue,
+  registerEnvValueReference,
+  SandboxLifecycleError,
   SandboxMountError,
   SandboxProviderError,
   SandboxUnsupportedFeatureError,
 } from '@openai/agents-core/sandbox';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
-import { liveMountCredentialAuthorityMatches } from '@openai/agents-core/sandbox/internal';
+import {
+  bindProcessEnvironmentAccess,
+  liveMountCredentialAuthorityMatches,
+  markRunStateDeserializationInput,
+  mergeManifestDelta,
+  serializeManifestRecord,
+} from '@openai/agents-core/sandbox/internal';
 import {
   DaytonaCloudBucketMountStrategy,
   DaytonaSandboxClient,
@@ -54,6 +67,8 @@ vi.mock('@daytonaio/sdk', () => ({
 
 describe('DaytonaSandboxClient', () => {
   beforeEach(() => {
+    clearSandboxEventSinks();
+    delete process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE;
     createMock.mockReset();
     getMock.mockReset();
     executeCommandMock.mockReset();
@@ -214,6 +229,62 @@ describe('DaytonaSandboxClient', () => {
       /failed to prepare the workspace root/,
     );
 
+    expect(deleteMock).toHaveBeenCalledOnce();
+  });
+
+  test('redacts protected workspace preparation and cleanup errors', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+    executeCommandMock.mockResolvedValueOnce({
+      exitCode: 1,
+      result: 'mkdir echoed daytona-secret',
+      artifacts: { stdout: 'mkdir echoed daytona-secret' },
+    });
+    deleteMock.mockRejectedValueOnce(
+      Object.assign(new Error('cleanup echoed daytona-secret'), {
+        cause: new Error('nested daytona-secret'),
+      }),
+    );
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const events: unknown[] = [];
+    addSandboxEventSink((event) => {
+      events.push(event);
+    });
+
+    let thrown: unknown;
+    try {
+      await client.create(
+        new Manifest({
+          environment: {
+            AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+          },
+        }),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+    expect(String(thrown)).not.toContain('daytona-secret');
+    expect(JSON.stringify(thrown)).not.toContain('daytona-secret');
+    expect(JSON.stringify(events)).not.toContain('daytona-secret');
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'sandbox_operation',
+        name: 'sandbox.start',
+        phase: 'error',
+        error: expect.objectContaining({
+          message:
+            'daytona sandbox creation failed for a sandbox with protected process environment values.',
+        }),
+      }),
+    );
+    expect((thrown as SandboxLifecycleError).details).toEqual({
+      provider: 'daytona',
+      operation: 'sandbox creation',
+      replacementSandboxId: 'daytona-test',
+    });
     expect(deleteMock).toHaveBeenCalledOnce();
   });
 
@@ -664,6 +735,669 @@ describe('DaytonaSandboxClient', () => {
     });
   });
 
+  test('rebinds process environment values from trusted client configuration', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+    const client = new DaytonaSandboxClient();
+    const clientOptions = {
+      processEnvironmentBindings: {
+        SANDBOX_TOKEN: 'AGENTS_TEST_DAYTONA_PROCESS_SOURCE',
+      },
+    };
+    const session = await client.create({
+      manifest: new Manifest({
+        environment: {
+          SANDBOX_TOKEN: new ProcessEnvValue({
+            name: 'AGENTS_TEST_DAYTONA_PROCESS_SOURCE',
+          }),
+        },
+      }),
+      options: {
+        ...clientOptions,
+        pauseOnExit: true,
+        env: { RUNTIME_ONLY: 'persisted-runtime-value' },
+      },
+    });
+
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        envVars: {
+          RUNTIME_ONLY: 'persisted-runtime-value',
+          SANDBOX_TOKEN: 'daytona-secret',
+        },
+      }),
+      undefined,
+    );
+    expect(JSON.stringify(executeCommandMock.mock.calls)).not.toContain(
+      'daytona-secret',
+    );
+    const serialized = await client.serializeSessionState(session.state);
+    expect(JSON.stringify(serialized)).not.toContain('daytona-secret');
+
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'rotated-daytona-secret';
+    const restored = await client.deserializeSessionState(
+      markRunStateDeserializationInput(serialized, { clientOptions }),
+    );
+    expect(restored.environment).toEqual({
+      RUNTIME_ONLY: 'persisted-runtime-value',
+      SANDBOX_TOKEN: 'rotated-daytona-secret',
+    });
+    restored.manifest = new Manifest({
+      ...restored.manifest,
+      environment: {
+        ...restored.manifest.environment,
+        MUTATE_RESUME_STATE: async () => {
+          restored.manifest = new Manifest();
+          return 'mutated';
+        },
+      },
+    });
+    createMock.mockClear();
+    const resumed = await client.resume(restored, { clientOptions });
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        envVars: expect.objectContaining({
+          RUNTIME_ONLY: 'persisted-runtime-value',
+          SANDBOX_TOKEN: 'rotated-daytona-secret',
+        }),
+      }),
+      undefined,
+    );
+    expect(deleteMock).toHaveBeenCalledOnce();
+    expect(resumed.state.environment).toEqual({
+      RUNTIME_ONLY: 'persisted-runtime-value',
+      SANDBOX_TOKEN: 'rotated-daytona-secret',
+      MUTATE_RESUME_STATE: 'mutated',
+    });
+    expect(resumed.state.manifest.environment.SANDBOX_TOKEN).toBeInstanceOf(
+      ProcessEnvValue,
+    );
+    executeCommandMock.mockClear();
+    expect(() => {
+      resumed.state.manifest = new Manifest();
+    }).toThrow(/cannot remove or replace protected ProcessEnvValue bindings/u);
+    const unboundReplacement = cloneManifest(resumed.state.manifest);
+    unboundReplacement.environment.EXTRA_TOKEN = new ProcessEnvValue({
+      name: 'AGENTS_TEST_EXTRA_PROCESS_SOURCE',
+    });
+    expect(() => {
+      resumed.state.manifest = unboundReplacement;
+    }).toThrow(/cannot remove or replace protected ProcessEnvValue bindings/u);
+    await resumed.execCommand({ cmd: 'env' });
+    expect(JSON.stringify(executeCommandMock.mock.calls)).not.toContain(
+      'rotated-daytona-secret',
+    );
+    const resumedSerialized = await client.serializeSessionState(resumed.state);
+    expect(JSON.stringify(resumedSerialized)).not.toContain(
+      'rotated-daytona-secret',
+    );
+    expect(resumedSerialized.environment).not.toHaveProperty('SANDBOX_TOKEN');
+
+    const mutatedState = await client.deserializeSessionState(
+      markRunStateDeserializationInput(serialized, { clientOptions }),
+    );
+    delete mutatedState.manifest.environment.SANDBOX_TOKEN;
+    createMock.mockClear();
+    getMock.mockClear();
+    await expect(
+      client.resume(mutatedState, { clientOptions }),
+    ).rejects.toThrow(
+      /bound sandbox manifest contains changed ProcessEnvValue references/u,
+    );
+    expect(createMock).not.toHaveBeenCalled();
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  test('rejects replacing a protected Daytona environment destination', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    executeCommandMock.mockClear();
+    uploadFileMock.mockClear();
+    const replacementResolver = vi.fn(async () => 'ordinary');
+
+    await expect(
+      session.applyManifest(
+        new Manifest({
+          environment: {
+            AGENTS_TEST_DAYTONA_PROCESS_SOURCE: replacementResolver,
+          },
+        }),
+      ),
+    ).rejects.toThrow(/protected process environment values/u);
+
+    expect(replacementResolver).not.toHaveBeenCalled();
+    expect(executeCommandMock).not.toHaveBeenCalled();
+    expect(uploadFileMock).not.toHaveBeenCalled();
+    expect(
+      session.state.manifest.environment.AGENTS_TEST_DAYTONA_PROCESS_SOURCE,
+    ).toBeInstanceOf(ProcessEnvValue);
+    const serialized = await client.serializeSessionState(session.state);
+    const restored = await client.deserializeSessionState(
+      markRunStateDeserializationInput(serialized, {
+        clientOptions: {
+          allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+        },
+      }),
+    );
+    expect(
+      restored.manifest.environment.AGENTS_TEST_DAYTONA_PROCESS_SOURCE,
+    ).toBeInstanceOf(ProcessEnvValue);
+  });
+
+  test('rejects importing bound process environment authority into a live Daytona session', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-import-secret';
+    const client = new DaytonaSandboxClient();
+    const session = await client.create(new Manifest());
+    const boundDelta = cloneManifest(
+      bindProcessEnvironmentAccess(
+        new Manifest({
+          environment: {
+            IMPORTED_TOKEN: new ProcessEnvValue({
+              name: 'AGENTS_TEST_DAYTONA_PROCESS_SOURCE',
+            }),
+          },
+        }),
+        {
+          processEnvironmentBindings: {
+            IMPORTED_TOKEN: 'AGENTS_TEST_DAYTONA_PROCESS_SOURCE',
+          },
+        },
+      ),
+    );
+    executeCommandMock.mockClear();
+    uploadFileMock.mockClear();
+
+    await expect(session.applyManifest(boundDelta)).rejects.toThrow(
+      /protected process environment destinations/u,
+    );
+
+    expect(executeCommandMock).not.toHaveBeenCalled();
+    expect(uploadFileMock).not.toHaveBeenCalled();
+    expect(session.state.manifest.environment).not.toHaveProperty(
+      'IMPORTED_TOKEN',
+    );
+  });
+
+  test('redacts resolver errors while applying a manifest to a protected Daytona session', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-apply-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    executeCommandMock.mockClear();
+
+    let thrown: unknown;
+    try {
+      await session.applyManifest(
+        new Manifest({
+          environment: {
+            FAILING: async () => {
+              throw Object.assign(
+                new Error('resolver echoed daytona-apply-secret'),
+                { cause: new Error('nested daytona-apply-secret') },
+              );
+            },
+          },
+        }),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+    expect(String(thrown)).not.toContain('daytona-apply-secret');
+    expect(JSON.stringify(thrown)).not.toContain('daytona-apply-secret');
+    expect((thrown as Error & { cause?: unknown }).cause).toBeUndefined();
+    expect(executeCommandMock).not.toHaveBeenCalled();
+  });
+
+  test('redacts provider setup errors while applying a manifest to a protected Daytona session', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-setup-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    uploadFileMock.mockRejectedValueOnce(
+      Object.assign(new Error('upload echoed daytona-setup-secret'), {
+        cause: new Error('nested daytona-setup-secret'),
+      }),
+    );
+
+    let thrown: unknown;
+    try {
+      await session.applyManifest(
+        new Manifest({
+          entries: {
+            'secret.txt': {
+              type: 'file',
+              content: 'content',
+            },
+          },
+        }),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+    expect(String(thrown)).not.toContain('daytona-setup-secret');
+    expect(JSON.stringify(thrown)).not.toContain('daytona-setup-secret');
+    expect((thrown as Error & { cause?: unknown }).cause).toBeUndefined();
+  });
+
+  test('redacts mixed environment resolver errors during Daytona resume', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-resolver-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    session.state.manifest = mergeManifestDelta(
+      session.state.manifest,
+      new Manifest({
+        environment: {
+          FAILING: async () => {
+            throw Object.assign(
+              new Error('resolver echoed daytona-resolver-secret'),
+              { cause: new Error('nested daytona-resolver-secret') },
+            );
+          },
+        },
+      }),
+    );
+    createMock.mockClear();
+
+    let thrown: unknown;
+    try {
+      await client.resume(session.state);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+    expect(String(thrown)).not.toContain('daytona-resolver-secret');
+    expect(JSON.stringify(thrown)).not.toContain('daytona-resolver-secret');
+    expect((thrown as Error & { cause?: unknown }).cause).toBeUndefined();
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  test('discards spoofed cleanup IDs from Daytona resume resolver errors', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-spoof-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    session.state.manifest = mergeManifestDelta(
+      session.state.manifest,
+      new Manifest({
+        environment: {
+          FAILING: async () => {
+            throw new SandboxLifecycleError('spoofed cleanup details', {
+              previousSandboxId: 'daytona-spoof-secret',
+              replacementSandboxId: 'nested-daytona-spoof-secret',
+            });
+          },
+        },
+      }),
+    );
+
+    let thrown: unknown;
+    try {
+      await client.resume(session.state);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+    expect(String(thrown)).not.toContain('daytona-spoof-secret');
+    expect(JSON.stringify(thrown)).not.toContain('daytona-spoof-secret');
+    expect((thrown as SandboxLifecycleError).details).toEqual({
+      provider: 'daytona',
+      operation: 'sandbox resume',
+      sandboxId: 'daytona-test',
+    });
+  });
+
+  test('redacts serializable environment reference errors during Daytona deserialization', async () => {
+    class ThrowingDaytonaReference extends EnvValueReference {
+      static readonly type = 'test.throwing_daytona_reference';
+
+      constructor() {
+        super();
+      }
+
+      override serialize(): Record<string, unknown> {
+        return {};
+      }
+
+      override async resolve(): Promise<string> {
+        throw Object.assign(
+          new Error('reference echoed daytona-deserialize-secret'),
+          { cause: new Error('nested daytona-deserialize-secret') },
+        );
+      }
+    }
+
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE =
+      'daytona-deserialize-secret';
+    const unregister = registerEnvValueReference(
+      ThrowingDaytonaReference,
+      () => new ThrowingDaytonaReference(),
+    );
+    try {
+      const client = new DaytonaSandboxClient({
+        allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+      });
+      const serialized = {
+        manifest: serializeManifestRecord(
+          new Manifest({
+            environment: {
+              AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+              FAILING: new ThrowingDaytonaReference(),
+            },
+          }),
+        ),
+        environment: {},
+        sandboxId: 'daytona-deserialize-error',
+        pauseOnExit: true,
+      };
+
+      let thrown: unknown;
+      try {
+        await client.deserializeSessionState(serialized);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+      expect(String(thrown)).not.toContain('daytona-deserialize-secret');
+      expect(JSON.stringify(thrown)).not.toContain(
+        'daytona-deserialize-secret',
+      );
+      expect((thrown as Error & { cause?: unknown }).cause).toBeUndefined();
+    } finally {
+      unregister();
+    }
+  });
+
+  test('does not replace a process environment sandbox after an ambiguous lookup failure', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    createMock.mockClear();
+    getMock.mockRejectedValueOnce(new Error('request timeout'));
+
+    await expect(client.resume(session.state)).rejects.toBeInstanceOf(
+      SandboxLifecycleError,
+    );
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  test('preserves the replacement after ambiguous protected sandbox retirement', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    session.state.manifest = mergeManifestDelta(
+      session.state.manifest,
+      new Manifest({
+        environment: {
+          MUTATING: () => {
+            session.state.sandboxId = 'spoofed-previous-sandbox-id';
+            delete session.state.manifest.environment
+              .AGENTS_TEST_DAYTONA_PROCESS_SOURCE;
+            return 'safe';
+          },
+        },
+      }),
+    );
+    const previousSandbox = await createMock.mock.results[0]!.value;
+    getMock.mockResolvedValueOnce({
+      ...previousSandbox,
+      id: 'daytona-provider-previous',
+    });
+    const replacementDelete = vi.fn().mockResolvedValue(undefined);
+    createMock.mockClear();
+    createMock.mockResolvedValueOnce({
+      ...previousSandbox,
+      id: 'daytona-replacement',
+      delete: replacementDelete,
+    });
+    let previousDeletionCompleted = false;
+    deleteMock.mockImplementationOnce(async () => {
+      previousDeletionCompleted = true;
+      throw Object.assign(new Error('provider echoed daytona-secret'), {
+        body: { environment: 'daytona-secret' },
+      });
+    });
+
+    let thrown: unknown;
+    try {
+      await client.resume(session.state);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+    expect(String(thrown)).not.toContain('daytona-secret');
+    expect(JSON.stringify(thrown)).not.toContain('spoofed-previous-sandbox-id');
+    expect((thrown as SandboxLifecycleError).details).toEqual({
+      provider: 'daytona',
+      operation: 'sandbox resume',
+      sandboxId: 'daytona-test',
+      previousSandboxId: 'daytona-provider-previous',
+      replacementSandboxId: 'daytona-replacement',
+    });
+    expect(previousDeletionCompleted).toBe(true);
+    expect(deleteMock).toHaveBeenCalledOnce();
+    expect(replacementDelete).not.toHaveBeenCalled();
+  });
+
+  test('retains the replacement ID when protected setup and cleanup fail', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    const previousSandbox = await createMock.mock.results[0]!.value;
+    const replacementDelete = vi
+      .fn()
+      .mockRejectedValue(new Error('cleanup echoed daytona-secret'));
+    createMock.mockClear();
+    createMock.mockResolvedValueOnce({
+      ...previousSandbox,
+      id: 'daytona-replacement',
+      delete: replacementDelete,
+    });
+    executeCommandMock.mockRejectedValueOnce(
+      new Error('setup echoed daytona-secret'),
+    );
+
+    let thrown: unknown;
+    try {
+      await client.resume(session.state);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+    expect(String(thrown)).not.toContain('daytona-secret');
+    expect(JSON.stringify(thrown)).not.toContain('daytona-secret');
+    expect((thrown as SandboxLifecycleError).details).toEqual({
+      provider: 'daytona',
+      operation: 'sandbox resume',
+      sandboxId: 'daytona-test',
+      previousSandboxId: 'daytona-test',
+      replacementSandboxId: 'daytona-replacement',
+    });
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(replacementDelete).toHaveBeenCalledOnce();
+  });
+
+  test('omits a confirmed-missing previous sandbox from cleanup details', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+    const client = new DaytonaSandboxClient({
+      allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+    });
+    const session = await client.create(
+      new Manifest({
+        environment: {
+          AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+        },
+      }),
+    );
+    const previousSandbox = await createMock.mock.results[0]!.value;
+    const replacementDelete = vi
+      .fn()
+      .mockRejectedValue(new Error('cleanup echoed daytona-secret'));
+    getMock.mockRejectedValueOnce(new Error('sandbox not found'));
+    createMock.mockClear();
+    createMock.mockResolvedValueOnce({
+      ...previousSandbox,
+      id: 'daytona-replacement',
+      delete: replacementDelete,
+    });
+    executeCommandMock.mockRejectedValueOnce(
+      new Error('setup echoed daytona-secret'),
+    );
+
+    let thrown: unknown;
+    try {
+      await client.resume(session.state);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SandboxLifecycleError);
+    expect(String(thrown)).not.toContain('daytona-secret');
+    expect(JSON.stringify(thrown)).not.toContain('daytona-secret');
+    expect((thrown as SandboxLifecycleError).details).toEqual({
+      provider: 'daytona',
+      operation: 'sandbox resume',
+      sandboxId: 'daytona-test',
+      replacementSandboxId: 'daytona-replacement',
+    });
+    expect(getMock).toHaveBeenCalledWith('daytona-test');
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(replacementDelete).toHaveBeenCalledOnce();
+  });
+
+  test('retries transient errors while retiring a protected sandbox', async () => {
+    vi.useFakeTimers();
+    try {
+      process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+      const client = new DaytonaSandboxClient({
+        allowedProcessEnvironmentKeys: ['AGENTS_TEST_DAYTONA_PROCESS_SOURCE'],
+      });
+      const session = await client.create(
+        new Manifest({
+          environment: {
+            AGENTS_TEST_DAYTONA_PROCESS_SOURCE: new ProcessEnvValue(),
+          },
+        }),
+      );
+      const previousSandbox = await createMock.mock.results[0]!.value;
+      const replacementDelete = vi.fn().mockResolvedValue(undefined);
+      createMock.mockClear();
+      createMock.mockResolvedValueOnce({
+        ...previousSandbox,
+        id: 'daytona-replacement',
+        delete: replacementDelete,
+      });
+      const stateChangeError = Object.assign(
+        new Error('Sandbox state change in progress'),
+        { statusCode: 409 },
+      );
+      deleteMock
+        .mockRejectedValueOnce(stateChangeError)
+        .mockResolvedValueOnce(undefined);
+
+      const resumePromise = client.resume(session.state);
+      await vi.waitFor(() => {
+        expect(deleteMock).toHaveBeenCalledOnce();
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      const resumed = await resumePromise;
+
+      expect(resumed.state.sandboxId).toBe('daytona-replacement');
+      expect(deleteMock).toHaveBeenCalledTimes(2);
+      expect(replacementDelete).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('rejects ungranted process environment values before Daytona effects', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'unused-secret';
+    const client = new DaytonaSandboxClient();
+
+    await expect(
+      client.create(
+        new Manifest({
+          environment: {
+            SANDBOX_TOKEN: new ProcessEnvValue({
+              name: 'AGENTS_TEST_DAYTONA_PROCESS_SOURCE',
+            }),
+          },
+        }),
+      ),
+    ).rejects.toThrow(/is not granted/u);
+    expect(daytonaConstructorMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
   test('stops on close when pauseOnExit is enabled and resumes by id', async () => {
     const client = new DaytonaSandboxClient();
     const session = await client.create(new Manifest(), {
@@ -721,6 +1455,46 @@ describe('DaytonaSandboxClient', () => {
 
     expect(getMock).not.toHaveBeenCalled();
     expect(startMock).not.toHaveBeenCalled();
+  });
+
+  test('validates protected resume mount environment before provider calls', async () => {
+    process.env.AGENTS_TEST_DAYTONA_PROCESS_SOURCE = 'daytona-secret';
+    const client = new DaytonaSandboxClient({
+      processEnvironmentBindings: {
+        SANDBOX_TOKEN: 'AGENTS_TEST_DAYTONA_PROCESS_SOURCE',
+      },
+    });
+
+    await expect(
+      client.resume({
+        manifest: new Manifest({
+          entries: {
+            data: {
+              type: 's3_mount',
+              bucket: 'agent-logs',
+              mountStrategy: new DaytonaCloudBucketMountStrategy(),
+            },
+          },
+          environment: {
+            AWS_ACCESS_KEY_ID: 'ambient-access-key',
+            AWS_SECRET_ACCESS_KEY: 'ambient-secret-key',
+            SANDBOX_TOKEN: new ProcessEnvValue({
+              name: 'AGENTS_TEST_DAYTONA_PROCESS_SOURCE',
+            }),
+          },
+        }),
+        environment: {
+          AWS_ACCESS_KEY_ID: 'ambient-access-key',
+          AWS_SECRET_ACCESS_KEY: 'ambient-secret-key',
+        },
+        sandboxId: 'daytona-test',
+        pauseOnExit: true,
+      } as never),
+    ).rejects.toBeInstanceOf(SandboxMountError);
+
+    expect(daytonaConstructorMock).not.toHaveBeenCalled();
+    expect(getMock).not.toHaveBeenCalled();
+    expect(createMock).not.toHaveBeenCalled();
   });
 
   test('requires broad acknowledgement for ambient credentials shadowed by inline credentials', async () => {
@@ -1249,6 +2023,22 @@ describe('DaytonaSandboxClient', () => {
       expect(session.state.manifest.entries).toHaveProperty('data');
     },
   );
+
+  test('rejects preserved reuse when the live Daytona manifest is protected', async () => {
+    const client = new DaytonaSandboxClient();
+    const session = await client.create(new Manifest());
+    session.state.manifest = new Manifest({
+      environment: { SANDBOX_TOKEN: new ProcessEnvValue() },
+    });
+
+    await expect(
+      client.canReusePreservedOwnedSession(session.state, {
+        trustedManifest: new Manifest({
+          environment: { SANDBOX_TOKEN: 'ordinary-value' },
+        }),
+      }),
+    ).resolves.toBe(false);
+  });
 
   test('rejects auto-stopped resume state containing cloud mounts', async () => {
     const client = new DaytonaSandboxClient();

@@ -27,6 +27,7 @@ import {
   validateSandboxArchiveLimits,
 } from '@openai/agents-core/sandbox';
 import {
+  assertProcessEnvValuesUnsupported,
   normalizePosixPath,
   relativePosixPathWithinRoot,
   shellQuote,
@@ -1293,6 +1294,7 @@ export class ModalSandboxClient implements SandboxClient<
     );
     assertCoreSnapshotUnsupported('ModalSandboxClient', createArgs.snapshot);
     const manifest = createArgs.manifest;
+    assertProcessEnvValuesUnsupported(manifest, 'modal');
     const resolvedOptions = resolveOptions(
       this.options,
       createArgs.options as ModalSandboxClientOptions | undefined,
@@ -1507,6 +1509,7 @@ export class ModalSandboxClient implements SandboxClient<
   }
 
   async resume(state: ModalSandboxSessionState): Promise<ModalSandboxSession> {
+    assertProcessEnvValuesUnsupported(state.manifest, 'modal');
     assertRemoteSandboxSessionStateCanResume(state);
     if (!state.sandboxId) {
       throw new UserError(

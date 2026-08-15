@@ -94,9 +94,10 @@ export function deserializeRemoteSandboxSessionStateValues(
 export async function rehydrateRemoteSandboxSessionStateValues(
   state: Record<string, unknown>,
   configuredEnvironment?: Record<string, string>,
+  prepareManifest: (manifest: Manifest) => Manifest = (manifest) => manifest,
 ): Promise<RemoteSandboxSessionStateValues> {
-  const manifest = deserializeManifest(
-    state.manifest as Record<string, unknown> | undefined,
+  const manifest = prepareManifest(
+    deserializeManifest(state.manifest as Record<string, unknown> | undefined),
   );
   return {
     manifest,
