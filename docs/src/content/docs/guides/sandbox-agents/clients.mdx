@@ -50,6 +50,8 @@ The same agent can usually run with either local client:
   title="Switch between local clients"
 />
 
+`DockerSandboxClient` uses Docker's default networking unless you set `networkMode: 'none'` in the client constructor or the per-run `sandbox.options`. The `'none'` mode starts the container with networking disabled. It cannot be combined with `exposedPorts`; the SDK rejects that configuration before creating or resuming a container. No other explicit `networkMode` value is currently supported.
+
 ### Session ownership
 
 There are two lifecycle styles.
