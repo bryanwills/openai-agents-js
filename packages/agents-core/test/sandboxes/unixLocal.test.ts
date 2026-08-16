@@ -11,6 +11,7 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   EnvValueReference,
@@ -1136,6 +1137,56 @@ describe('UnixLocalSandboxClient', () => {
         data: expect.any(Uint8Array),
         mediaType: 'image/svg+xml',
       },
+    });
+  });
+
+  it('validates raster content while preserving SVG filename compatibility', async () => {
+    const client = new UnixLocalSandboxClient({
+      workspaceBaseDir: rootDir,
+    });
+    const session = await client.create(
+      new Manifest({
+        entries: {
+          'fake.png': {
+            type: 'file',
+            content: 'not an image\n',
+          },
+          'payload.bin': {
+            type: 'file',
+            content: ONE_BY_ONE_PNG,
+          },
+          'commented.svg': {
+            type: 'file',
+            content: '<!-- generated -->\n<svg></svg>',
+          },
+          'vector.svgz': {
+            type: 'file',
+            content: Uint8Array.from(gzipSync('<svg></svg>')),
+          },
+        },
+      }),
+    );
+
+    await expect(session.viewImage({ path: 'fake.png' })).rejects.toThrow(
+      'Unsupported image format for view_image: fake.png',
+    );
+    await expect(
+      session.viewImage({ path: 'payload.bin' }),
+    ).resolves.toMatchObject({
+      type: 'image',
+      image: { mediaType: 'image/png' },
+    });
+    await expect(
+      session.viewImage({ path: 'commented.svg' }),
+    ).resolves.toMatchObject({
+      type: 'image',
+      image: { mediaType: 'image/svg+xml' },
+    });
+    await expect(
+      session.viewImage({ path: 'vector.svgz' }),
+    ).resolves.toMatchObject({
+      type: 'image',
+      image: { mediaType: 'image/svg+xml' },
     });
   });
 
